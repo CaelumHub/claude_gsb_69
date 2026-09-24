@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>合约交互 · LightChain</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside id="sidebar"></aside>
+  <div class="main">
+    <header id="topbar"></header>
+    <main class="content">
+      <div class="page-head">
+        <h1>合约交互</h1>
+        <p>加载已部署合约，调用只读/写入函数，查看状态、余额与事件日志。</p>
+      </div>
+
+      <div class="card">
+        <div class="flex">
+          <h2 style="margin:0;">合约选择</h2>
+          <select id="contractSelect" style="max-width:340px;" onchange="selectContract(this.value)"></select>
+          <button class="btn ghost sm" onclick="refreshContracts()">刷新</button>
+          <div class="spacer"></div>
+          <span class="badge blue" id="contractBalance"></span>
+        </div>
+      </div>
+
+      <div class="grid" style="grid-template-columns: 1.3fr 1fr; margin-top:16px;">
+        <div class="card">
+          <h2>调用函数</h2>
+          <div class="row">
+            <div class="field grow"><label>函数</label>
+              <select id="funcSelect"></select></div>
+            <div class="field grow"><label>参数 (JSON 数组)</label>
+              <input id="funcArgs" class="mono" placeholder='["arg1", 2]'></div>
+          </div>
+          <div class="row">
+            <div class="field"><label>调用账户</label>
+              <select id="callFrom"></select></div>
+            <div class="field"><label>附带金额 (value)</label>
+              <input id="callValue" type="number" min="0" step="any" value="0"></div>
+          </div>
+          <div class="flex">
+            <button class="btn" onclick="callRead()">🔍 只读调用 (模拟)</button>
+            <button class="btn green" onclick="callWrite()">✍ 写入调用 (上链)</button>
+            <label class="small muted" style="display:flex;align-items:center;gap:4px;">
+              <input type="checkbox" id="autoMineChk" checked style="width:auto;"> 写入后立即出块</label>
+          </div>
+          <div id="callResult" style="margin-top:12px;"></div>
+        </div>
+
+        <div class="card">
+          <h2>合约信息</h2>
+          <dl class="kv" id="contractInfo"></dl>
+          <div class="section-title">持久化状态 (state)</div>
+          <pre class="code" id="storageView" style="max-height:200px;">{}</pre>
+        </div>
+      </div>
+
+      <div class="grid cols-2" style="margin-top:16px;">
+        <div class="card">
+          <h2>合约代码</h2>
+          <pre class="code" id="codeView" style="max-height:340px;"></pre>
+        </div>
+        <div class="card">
+          <h2>事件日志 <span class="hint" id="eventHint"></span></h2>
+          <div id="eventList" style="max-height:340px; overflow:auto;"></div>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<script src="/static/js/api.js"></script>
+<script src="/static/js/app.js"></script>
+<script>
+window.PAGE = "interact";
+let contracts = [];
+let wallets = [];
+let current = null;
+let currentDetail = null;
+
+async function init() {
+  await loadWallets();
+  await refreshContracts();
+  pollStatus(6000);
+}
+
+async function loadWallets() {
+  const d = await API.get("/api/wallet/list");
+  wallets = d.wallets;
+  $("#callFrom").innerHTML = wallets.map((w, i) =>
+    `<option value="${i}">${esc(w.label || fmt.addr(w.address, 6))}</option>`).join("");
+}
+
+async function refreshContracts() {
+  const d = await API.get("/api/contract/list");
+  contracts = d.contracts;
+  const sel = $("#contractSelect");
+  sel.innerHTML = contracts.map(c =>
+    `<option value="${c.address}">${fmt.addr(c.address, 10)}</option>`).join("");
+  if (!contracts.length) {
+    $("#contractSelect").innerHTML = `<option value="">无已部署合约</option>`;
+    current = null;
+    return;
+  }
+  const qAddr = new URLSearchParams(location.search).get("addr");
+  if (qAddr && contracts.some(c => c.address === qAddr)) sel.value = qAddr;
+  selectContract(sel.value);
+}
+
+async function selectContract(addr) {
+  if (!addr) return;
+  current = addr;
+  currentDetail = await API.get("/api/contract/" + addr);
+  const c = currentDetail;
+  $("#contractBalance").textContent = "余额 " + fmt.amount(c.balance) + " LC";
+  $("#contractInfo").innerHTML = `
+    <dt>合约地址</dt><dd class="hash">${esc(c.address)}</dd>
+    <dt>创建者</dt><dd class="addr">${esc(c.creator || "—")}</dd>
+    <dt>余额</dt><dd class="mono-num">${fmt.amount(c.balance)} LC</dd>
+    <dt>状态键数</dt><dd>${Object.keys(c.storage || {}).length}</dd>`;
+  $("#storageView").textContent = JSON.stringify(c.storage || {}, null, 2);
+  $("#codeView").textContent = c.code || "";
+  renderFunctions(c.code);
+  renderEvents(c.events || []);
+}
+
+function renderFunctions(code) {
+  const fns = [];
+  const re = /^def\s+(\w+)\s*\(([^)]*)\)/gm;
+  let m;
+  while ((m = re.exec(code || ""))) {
+    fns.push({ name: m[1], params: m[2] });
+  }
+  $("#funcSelect").innerHTML = fns.length
+    ? fns.map(f => `<option value="${f.name}">${f.name}(${f.params})${f.name === "init" ? " [构造]" : ""}</option>`).join("")
+    : `<option value="">无函数</option>`;
+  if (fns.length) {
+    const first = fns.find(f => f.name !== "init") || fns[0];
+    $("#funcSelect").value = first.name;
+  }
+}
+
+function renderEvents(events) {
+  $("#eventHint").textContent = `（${events.length} 条）`;
+  const box = $("#eventList");
+  if (!events.length) { box.innerHTML = `<div class="empty">暂无事件</div>`; return; }
+  box.innerHTML = events.slice().reverse().map(e => `
+    <div style="padding:8px 10px;border:1px solid var(--border);border-radius:8px;margin-bottom:8px;">
+      <div class="flex"><span class="badge purple">${esc(e.event)}</span>
+        <span class="muted small">高度 #${e.height}</span>
+        <span class="spacer"></span>
+        <span class="muted small">${fmt.hash(e.txid, 6)}</span></div>
+      <pre class="code" style="margin-top:6px;font-size:11.5px;padding:8px;">${esc(JSON.stringify(e.data, null, 2))}</pre>
+    </div>`).join("");
+}
+
+function parseArgs() {
+  const raw = $("#funcArgs").value.trim();
+  if (!raw) return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? v : [v];
+  } catch (e) { return null; }
+}
+
+async function callRead() {
+  if (!current) return toast("请先选择合约", "err");
+  const fn = $("#funcSelect").value;
+  const args = parseArgs();
+  if (args === null) return toast("参数不是合法 JSON", "err");
+  const sender = wallets.length ? wallets[Number($("#callFrom").value || 0)].address : "0x0";
+  try {
+    const d = await API.post(`/api/contract/${current}/call`,
+      { function: fn, args, sender });
+    renderCallResult(d);
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function callWrite() {
+  if (!current) return toast("请先选择合约", "err");
+  const fn = $("#funcSelect").value;
+  const args = parseArgs();
+  if (args === null) return toast("参数不是合法 JSON", "err");
+  const idx = Number($("#callFrom").value || 0);
+  if (!wallets[idx]) return toast("请先生成钱包", "err");
+  const sender = wallets[idx].address;
+  const value = parseFloat($("#callValue").value || 0);
+  try {
+    const d = await API.post(`/api/contract/${current}/invoke`,
+      { function: fn, args, sender, value, mine: $("#autoMineChk").checked });
+    toast(d.ok ? "写入交易已提交: " + fmt.hash(d.txid, 8) : d.reason, d.ok ? "ok" : "err");
+    if (d.ok) {
+      await new Promise(r => setTimeout(r, 600));
+      await selectContract(current);
+      renderTopbar();
+    }
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function renderCallResult(d) {
+  const box = $("#callResult");
+  if (!d.ok) {
+    box.innerHTML = `<span class="badge red">✗ ${esc(d.error)}</span>`;
+    return;
+  }
+  box.innerHTML = `
+    <div class="flex"><span class="badge green">✓ 调用成功</span>
+      <span class="muted small">指令 ${d.instructions}</span></div>
+    <div class="kv" style="margin-top:10px;">
+      <dt>返回值</dt><dd>${esc(JSON.stringify(d.return))}</dd>
+      ${d.output ? `<dt>输出</dt><dd><pre class="code" style="margin:0;max-height:120px;">${esc(d.output)}</pre></dd>` : ""}
+      ${(d.events || []).length ? `<dt>事件</dt><dd>${d.events.map(e => esc(e.event)).join(", ")}</dd>` : ""}
+    </div>`;
+}
+
+document.addEventListener("DOMContentLoaded", init);
+</script>
+</body>
+</html>

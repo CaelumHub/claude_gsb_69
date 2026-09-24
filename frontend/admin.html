@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>管理后台 · LightChain</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside id="sidebar"></aside>
+  <div class="main">
+    <header id="topbar"></header>
+    <main class="content">
+      <div class="page-head">
+        <h1>管理后台</h1>
+        <p>链完整性校验、版本回滚、重置、分叉状态与节点日志。</p>
+      </div>
+
+      <div class="grid cols-4">
+        <div class="card stat accent"><div class="label">区块高度</div><div class="value" id="height">—</div></div>
+        <div class="card stat green"><div class="label">累计工作量</div><div class="value small" id="chainwork">—</div></div>
+        <div class="card stat amber"><div class="label">分叉分支</div><div class="value" id="forkBranches">—</div></div>
+        <div class="card stat purple"><div class="label">版本记录</div><div class="value" id="versionCount">—</div></div>
+      </div>
+
+      <div class="grid" style="grid-template-columns: 1fr 1fr; margin-top:16px;">
+        <div class="card">
+          <h2>链完整性校验（防篡改）</h2>
+          <p class="hint" style="margin:6px 0;">逐块重算哈希、校验链接、签名、难度与状态根，检测区块/状态文件是否被篡改。</p>
+          <button class="btn primary" onclick="runValidate()">🔒 执行全链校验</button>
+          <div id="validateResult" style="margin-top:12px;"></div>
+        </div>
+
+        <div class="card">
+          <h2>危险操作</h2>
+          <p class="hint" style="margin:6px 0;">回滚会丢弃目标高度以上的区块；重置会将整条链还原为创世块。二者均不可逆。</p>
+          <div class="flex">
+            <button class="btn amber" onclick="doRollback()">⏪ 回滚到选定高度</button>
+            <button class="btn danger" onclick="doReset()">💣 重置整条链</button>
+          </div>
+          <div id="dangerResult" style="margin-top:12px;"></div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="flex">
+          <h2 style="margin:0;">版本记录（回滚点）</h2>
+          <div class="spacer"></div>
+          <select id="rollbackHeight" style="max-width:200px;"></select>
+          <button class="btn ghost sm" onclick="loadVersions()">刷新</button>
+        </div>
+        <div id="versionTable" class="table-wrap" style="margin-top:12px;"></div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="flex">
+          <h2 style="margin:0;">节点日志</h2>
+          <div class="spacer"></div>
+          <button class="btn ghost sm" onclick="loadLogs()">刷新</button>
+        </div>
+        <div id="logList" style="margin-top:12px; max-height:360px; overflow:auto;"></div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<script src="/static/js/api.js"></script>
+<script src="/static/js/app.js"></script>
+<script>
+window.PAGE = "admin";
+let versions = [];
+
+async function init() {
+  await loadStatus();
+  await loadVersions();
+  await loadLogs();
+  pollStatus(8000);
+}
+
+async function loadStatus() {
+  const s = await API.get("/api/node/status");
+  const a = await API.get("/api/admin/status");
+  $("#height").textContent = "#" + s.height;
+  $("#chainwork").textContent = (s.chainwork || 0).toLocaleString();
+  const forkHeights = Object.keys(a.fork_store || {}).length;
+  $("#forkBranches").textContent = forkHeights;
+  $("#versionCount").textContent = a.status.accounts + " 账户 / " + a.status.contracts + " 合约";
+}
+
+async function loadVersions() {
+  const d = await API.get("/api/admin/versions");
+  versions = d.versions;
+  $("#versionCount").textContent = versions.length;
+  const sel = $("#rollbackHeight");
+  const heights = [...new Set(versions.map(v => v.height))].sort((a, b) => a - b);
+  sel.innerHTML = heights.map(h => `<option value="${h}">高度 #${h}</option>`).join("");
+  if (!versions.length) {
+    $("#versionTable").innerHTML = `<div class="empty">暂无版本记录</div>`;
+    return;
+  }
+  $("#versionTable").innerHTML = `<table><thead><tr>
+    <th>高度</th><th>区块哈希</th><th>记录时间</th></tr></thead>
+    <tbody>${versions.slice().reverse().slice(0, 40).map(v => `
+      <tr>
+        <td class="mono-num" style="color:var(--accent-2);">#${v.height}</td>
+        <td class="hash">${esc(v.head_hash)}</td>
+        <td class="muted small">${fmt.time(v.time)}</td>
+      </tr>`).join("")}</tbody></table>`;
+}
+
+async function runValidate() {
+  $("#validateResult").innerHTML = `<span class="muted">校验中…</span>`;
+  const r = await API.get("/api/admin/validate");
+  if (r.valid) {
+    $("#validateResult").innerHTML = `
+      <div class="flex"><span class="badge green">✓ 链完整，无篡改</span>
+        <span class="muted small">已校验 ${r.checked} 个区块</span></div>`;
+  } else {
+    $("#validateResult").innerHTML = `
+      <div><span class="badge red">✗ 发现 ${r.errors.length} 处异常</span></div>
+      <ul style="margin:10px 0 0 20px;">${r.errors.map(e => `<li class="small mono" style="color:var(--red);margin:3px 0;">${esc(e)}</li>`).join("")}</ul>`;
+  }
+}
+
+async function doRollback() {
+  const height = parseInt($("#rollbackHeight").value);
+  if (isNaN(height)) return toast("请选择回滚高度", "err");
+  if (!confirm(`确定回滚到高度 #${height}？此高度以上的区块将被丢弃。`)) return;
+  const d = await API.post("/api/admin/rollback", { height });
+  $("#dangerResult").innerHTML = d.ok
+    ? `<span class="badge green">✓ ${esc(d.message)}</span>`
+    : `<span class="badge red">✗ ${esc(d.error)}</span>`;
+  await loadStatus(); await loadVersions(); renderTopbar();
+}
+
+async function doReset() {
+  if (!confirm("确定重置整条链？所有区块、状态、合约将被清除，仅保留创世块。此操作不可逆！")) return;
+  const d = await API.post("/api/admin/reset");
+  $("#dangerResult").innerHTML = d.ok
+    ? `<span class="badge green">✓ 已重置，当前高度 #${d.height}</span>`
+    : `<span class="badge red">✗ 重置失败</span>`;
+  await loadStatus(); await loadVersions(); renderTopbar();
+}
+
+async function loadLogs() {
+  const d = await API.get("/api/admin/logs?limit=120");
+  const box = $("#logList");
+  if (!d.logs.length) { box.innerHTML = `<div class="empty">暂无日志</div>`; return; }
+  box.innerHTML = d.logs.map(l => `
+    <div style="padding:6px 8px;border-bottom:1px solid var(--border);font-size:12.5px;display:flex;gap:10px;">
+      <span class="mono muted" style="min-width:90px;">${fmt.time(l.time).slice(-8)}</span>
+      <span class="badge ${l.level === 'error' ? 'red' : l.level === 'warn' ? 'amber' : 'blue'}" style="min-width:44px;">${esc(l.level)}</span>
+      <span class="mono">${esc(l.message)}</span>
+    </div>`).join("");
+}
+
+document.addEventListener("DOMContentLoaded", init);
+</script>
+</body>
+</html>

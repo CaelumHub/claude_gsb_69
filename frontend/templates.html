@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>合约模板库 · LightChain</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside id="sidebar"></aside>
+  <div class="main">
+    <header id="topbar"></header>
+    <main class="content">
+      <div class="page-head">
+        <h1>合约模板库</h1>
+        <p>浏览内置合约模板，预览源码，一键部署，或保存自定义模板。</p>
+      </div>
+
+      <div class="grid" style="grid-template-columns: 1fr 1.3fr;">
+        <div class="card">
+          <div class="flex">
+            <h2 style="margin:0;">模板目录</h2>
+            <div class="spacer"></div>
+            <button class="btn ghost sm" onclick="loadTemplates()">刷新</button>
+          </div>
+          <div id="catalog" style="margin-top:12px; max-height:520px; overflow:auto;"></div>
+        </div>
+
+        <div class="card">
+          <h2 id="detailTitle">模板详情</h2>
+          <div id="detailBody" class="small" style="line-height:1.8;">
+            <div class="empty">👈 从左侧选择一个模板查看详情</div>
+          </div>
+          <div id="detailSource" style="margin-top:12px;"></div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <h2>保存自定义模板</h2>
+        <p class="hint" style="margin:6px 0;">将当前编写好的合约保存为模板，便于复用。</p>
+        <div class="row">
+          <div class="field"><label>模板名（英文标识）</label><input id="tplName" class="mono" placeholder="my_contract"></div>
+          <div class="field"><label>标题</label><input id="tplTitle" placeholder="我的合约"></div>
+        </div>
+        <div class="field"><label>描述</label><input id="tplDesc" placeholder="一句话描述合约用途"></div>
+        <div class="field"><label>合约源码</label>
+          <textarea id="tplSource" class="mono" rows="8" style="width:100%;font-size:12px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:10px;"></textarea></div>
+        <button class="btn primary" onclick="saveCustom()">💾 保存模板</button>
+      </div>
+    </main>
+  </div>
+</div>
+
+<script src="/static/js/api.js"></script>
+<script src="/static/js/app.js"></script>
+<script>
+window.PAGE = "templates";
+let catalog = [];
+let current = null;
+
+async function init() {
+  await loadTemplates();
+  pollStatus(10000);
+}
+
+async function loadTemplates() {
+  const d = await API.get("/api/templates");
+  catalog = d.templates;
+  const groups = {};
+  for (const t of catalog) (groups[t.category] = groups[t.category] || []).push(t);
+  const box = $("#catalog");
+  box.innerHTML = Object.entries(groups).map(([cat, list]) => `
+    <div class="section-title" style="margin-top:12px;">${esc(cat)}</div>
+    ${list.map(t => `
+      <div class="tpl-item ${current === t.name ? 'active' : ''}" data-name="${esc(t.name)}"
+           style="padding:10px 12px;border:1px solid var(--border);border-radius:8px;margin:6px 0;cursor:pointer;"
+           onclick="selectTpl('${esc(t.name)}')">
+        <div class="flex">
+          <span style="font-weight:600;">${esc(t.title)}</span>
+          ${t.custom ? `<span class="badge amber">自定义</span>` : ""}
+          <span class="spacer"></span>
+          <span class="badge blue sm">${t.functions.length} 函数</span>
+        </div>
+        <div class="muted small" style="margin-top:4px;">${esc(t.description)}</div>
+      </div>`).join("")}
+  `).join("");
+}
+
+async function selectTpl(name) {
+  current = name;
+  loadTemplates(); // refresh active highlight
+  const d = await API.get("/api/templates/" + name);
+  const t = d.template;
+  $("#detailTitle").textContent = t.title;
+  const ctor = (t.constructor || []).map(c =>
+    `${c.name}:${c.type}（${c.desc || ""}）`).join("、");
+  $("#detailBody").innerHTML = `
+    <div><span class="muted">分类：</span>${esc(t.category)}</div>
+    <div><span class="muted">标识：</span><span class="mono">${esc(t.name)}</span></div>
+    <div><span class="muted">构造参数：</span>${ctor ? esc(ctor) : "无"}</div>
+    <div><span class="muted">函数：</span>${t.functions.map(f => `<span class="mono">${esc(f.name)}</span>`).join(" · ")}</div>
+    <div style="margin-top:8px;"><span class="muted">描述：</span>${esc(t.description)}</div>
+    <div class="flex" style="margin-top:12px;">
+      <button class="btn green sm" onclick="deployTpl('${esc(t.name)}')">🚀 部署此模板</button>
+      <button class="btn ghost sm" onclick="copySource()">📋 复制源码</button>
+    </div>`;
+  $("#detailSource").innerHTML = `<div class="section-title">源码</div>
+    <pre class="code" style="max-height:280px;">${esc(t.source)}</pre>`;
+}
+
+function deployTpl(name) {
+  localStorage.setItem("lc_deploy_template", name);
+  location.href = "deploy.html";
+}
+
+function copySource() {
+  const pre = $("#detailSource pre");
+  if (!pre) return;
+  navigator.clipboard.writeText(pre.textContent).then(
+    () => toast("已复制源码到剪贴板", "ok"),
+    () => toast("复制失败", "err"));
+}
+
+async function saveCustom() {
+  const name = $("#tplName").value.trim();
+  const title = $("#tplTitle").value.trim();
+  const source = $("#tplSource").value.trim();
+  if (!name || !source) return toast("请填写模板名与源码", "err");
+  if (!/^[a-zA-Z0-9_]+$/.test(name)) return toast("模板名只能包含字母数字下划线", "err");
+  const d = await API.post("/api/templates/save", {
+    name, title: title || name,
+    description: $("#tplDesc").value.trim(),
+    constructor: [], functions: [], source,
+  });
+  toast(d.ok ? "模板已保存: " + name : d.error, d.ok ? "ok" : "err");
+  await loadTemplates();
+}
+
+document.addEventListener("DOMContentLoaded", init);
+</script>
+</body>
+</html>

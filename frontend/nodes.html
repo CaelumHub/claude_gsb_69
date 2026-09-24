@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>节点状态监控 · LightChain</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside id="sidebar"></aside>
+  <div class="main">
+    <header id="topbar"></header>
+    <main class="content">
+      <div class="page-head">
+        <h1>节点状态监控</h1>
+        <p>监控本节点运行状态、P2P 邻居，并扫描整个模拟多节点网络。</p>
+      </div>
+
+      <div class="grid cols-4">
+        <div class="card stat accent"><div class="label">节点</div><div class="value" id="nodeId">—</div></div>
+        <div class="card stat green"><div class="label">区块高度</div><div class="value" id="height">—</div></div>
+        <div class="card stat amber"><div class="label">在线时长</div><div class="value" id="uptime">—</div></div>
+        <div class="card stat purple"><div class="label">邻居节点</div><div class="value" id="peerCount">—</div></div>
+      </div>
+
+      <div class="grid" style="grid-template-columns: 1fr 1fr; margin-top:16px;">
+        <div class="card">
+          <h2>本节点信息</h2>
+          <dl class="kv" id="nodeInfo"></dl>
+        </div>
+        <div class="card">
+          <h2>链状态</h2>
+          <dl class="kv" id="chainStatus"></dl>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="flex">
+          <h2 style="margin:0;">P2P 邻居</h2>
+          <div class="spacer"></div>
+          <button class="btn ghost sm" onclick="loadPeers()">刷新</button>
+          <button class="btn primary sm" onclick="scanNetwork()">📡 扫描网络</button>
+        </div>
+        <div id="peerTable" class="table-wrap" style="margin-top:12px;"></div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <h2>网络拓扑（扫描结果）</h2>
+        <p class="hint" style="margin:6px 0 12px;">探测 8000–8002 端口的节点，点击「切换」可将当前页面切到该节点的 API。</p>
+        <div id="networkGrid"></div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<script src="/static/js/api.js"></script>
+<script src="/static/js/app.js"></script>
+<script>
+window.PAGE = "nodes";
+
+async function init() {
+  await loadStatus();
+  await loadPeers();
+  scanNetwork();
+  pollStatus(5000);
+}
+
+async function loadStatus() {
+  const info = await API.get("/api/node/info");
+  const s = await API.get("/api/node/status");
+  $("#nodeId").textContent = info.id;
+  $("#height").textContent = "#" + s.height;
+  $("#uptime").textContent = fmt.dur(info.uptime);
+  $("#peerCount").textContent = info.peers;
+  $("#nodeInfo").innerHTML = `
+    <dt>节点 ID</dt><dd>${esc(info.id)}</dd>
+    <dt>监听地址</dt><dd class="mono">${esc(info.host)}:${info.port}</dd>
+    <dt>版本</dt><dd>${esc(info.version)}</dd>
+    <dt>挖矿状态</dt><dd><span class="badge ${info.mining ? 'green' : 'gray'}">${info.mining ? '运行中' : '已停止'}</span></dd>
+    <dt>算力</dt><dd class="mono-num">${Math.round(s.hashrate).toLocaleString()} H/s</dd>
+    <dt>交易池</dt><dd class="mono-num">${s.txpool_size} 条</dd>`;
+  $("#chainStatus").innerHTML = `
+    <dt>最新区块哈希</dt><dd class="hash">${esc(s.head_hash || "—")}</dd>
+    <dt>累计工作量</dt><dd class="mono-num">${(s.chainwork || 0).toLocaleString()}</dd>
+    <dt>当前难度</dt><dd class="mono-num">${s.difficulty}</dd>
+    <dt>状态根</dt><dd class="hash">${esc(s.state_root || "—")}</dd>
+    <dt>账户数</dt><dd class="mono-num">${s.accounts}</dd>
+    <dt>合约数</dt><dd class="mono-num">${s.contracts}</dd>`;
+}
+
+async function loadPeers() {
+  const d = await API.get("/api/network/peers");
+  const box = $("#peerTable");
+  if (!d.peers.length) {
+    box.innerHTML = `<div class="empty"><div class="big">🕸</div>暂无邻居节点，可在「网络设置」中添加</div>`;
+    return;
+  }
+  box.innerHTML = `<table><thead><tr>
+    <th>节点 ID</th><th>地址</th><th>状态</th><th>高度</th><th>累计工作量</th><th>延迟</th></tr></thead>
+    <tbody>${d.peers.map(p => `
+      <tr>
+        <td class="mono">${esc(p.id)}</td>
+        <td class="mono">${esc(p.url)}</td>
+        <td><span class="badge ${p.status === 'up' ? 'green' : p.status === 'down' ? 'red' : 'gray'}">${p.status}</span></td>
+        <td class="mono-num">${p.height ?? '—'}</td>
+        <td class="mono-num">${p.chainwork != null ? p.chainwork.toLocaleString() : '—'}</td>
+        <td class="mono-num">${p.latency_ms != null ? p.latency_ms + ' ms' : '—'}</td>
+      </tr>`).join("")}</tbody></table>`;
+}
+
+async function scanNetwork() {
+  const grid = $("#networkGrid");
+  grid.innerHTML = `<div class="empty">正在扫描 8000–8002 端口…</div>`;
+  const ports = [8000, 8001, 8002];
+  const results = await Promise.all(ports.map(async (port) => {
+    const url = `http://127.0.0.1:${port}/p2p/status`;
+    try {
+      const r = await fetch(url, { method: "GET" });
+      if (!r.ok) return { port, up: false };
+      const j = await r.json();
+      return { port, up: true, data: j };
+    } catch (e) { return { port, up: false }; }
+  }));
+
+  const currentPort = new URL(API.base()).port || "8000";
+  grid.innerHTML = `<div class="grid cols-3">${results.map(r => {
+    if (!r.up) return `
+      <div class="card" style="border-style:dashed;opacity:.55;">
+        <div class="flex"><span class="badge gray">离线</span><span class="mono">:${r.port}</span></div>
+        <div class="muted small" style="margin-top:8px;">未监听的节点</div>
+      </div>`;
+    const j = r.data;
+    const isCur = String(r.port) === String(currentPort);
+    return `
+      <div class="card">
+        <div class="flex">
+          <span class="badge green">● 在线</span>
+          <span class="mono" style="font-weight:700;">${esc(j.id || 'node')}</span>
+          <div class="spacer"></div>
+          ${isCur ? `<span class="badge blue">当前</span>` : `<button class="btn ghost sm" onclick="switchNode(${r.port})">切换</button>`}
+        </div>
+        <dl class="kv" style="margin-top:10px;">
+          <dt>端口</dt><dd class="mono-num">${r.port}</dd>
+          <dt>高度</dt><dd class="mono-num">#${j.height}</dd>
+          <dt>累计工作量</dt><dd class="mono-num">${(j.chainwork || 0).toLocaleString()}</dd>
+          <dt>最新哈希</dt><dd class="hash">${esc((j.head_hash || '').slice(0, 18))}…</dd>
+        </dl>
+      </div>`;
+  }).join("")}</div>`;
+}
+
+function switchNode(port) {
+  localStorage.setItem("lc_api_base", `http://127.0.0.1:${port}`);
+  toast("已切换到端口 " + port + "，正在重载…", "info");
+  setTimeout(() => location.reload(), 500);
+}
+
+document.addEventListener("DOMContentLoaded", init);
+</script>
+</body>
+</html>

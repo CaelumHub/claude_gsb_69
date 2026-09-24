@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>区块浏览器 · LightChain</title>
+<link rel="stylesheet" href="/static/css/style.css">
+<style>
+  .chain-row { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+  .blk { padding: 8px 12px; border-radius: 8px; background: var(--panel-2);
+    border: 1px solid var(--border); cursor: pointer; text-align: center; min-width: 66px;
+    transition: all .15s; }
+  .blk:hover { border-color: var(--accent); transform: translateY(-2px); }
+  .blk .n { font-family: var(--mono); font-weight: 700; color: var(--accent-2); }
+  .blk .t { font-size: 10px; color: var(--faint); }
+  .blk.genesis { border-color: var(--purple); }
+  .chain-link { color: var(--faint); font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside id="sidebar"></aside>
+  <div class="main">
+    <header id="topbar"></header>
+    <main class="content">
+      <div class="page-head">
+        <h1>区块浏览器</h1>
+        <p>查看链式结构、区块头与交易详情，支持按哈希或高度检索。</p>
+      </div>
+
+      <div class="grid cols-4">
+        <div class="card stat accent"><div class="label">区块高度</div><div class="value" id="height">—</div></div>
+        <div class="card stat green"><div class="label">累计工作量</div><div class="value small" id="chainwork">—</div></div>
+        <div class="card stat amber"><div class="label">总交易数</div><div class="value" id="totalTx">—</div></div>
+        <div class="card stat purple"><div class="label">合约数量</div><div class="value" id="contracts">—</div></div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="flex">
+          <h2 style="margin:0;">链式结构</h2>
+          <div class="spacer"></div>
+          <input id="searchBox" class="mono" style="max-width:320px;"
+                 placeholder="输入区块哈希 / 高度 / 交易ID 查询" onkeydown="if(event.key==='Enter')doSearch()">
+          <button class="btn primary" onclick="doSearch()">🔍 查询</button>
+        </div>
+        <div id="chainViz" class="chain-row" style="margin-top:14px; overflow-x:auto; padding:6px 2px;"></div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <h2>区块列表 <span class="hint" id="listHint"></span></h2>
+        <div id="blockTable"></div>
+      </div>
+
+      <div id="detailCard" class="card" style="margin-top:16px; display:none;"></div>
+    </main>
+  </div>
+</div>
+
+<script src="/static/js/api.js"></script>
+<script src="/static/js/app.js"></script>
+<script>
+window.PAGE = "explorer";
+let chain = [];
+
+async function init() {
+  await loadChain();
+  pollStatus(6000);
+}
+
+async function loadChain() {
+  const d = await API.get("/api/chain");
+  chain = d.blocks;
+  $("#height").textContent = "#" + d.height;
+  $("#chainwork").textContent = d.chainwork.toLocaleString();
+  renderChainViz();
+  renderBlockTable();
+  // totals
+  const st = await API.get("/api/stats/overview");
+  $("#totalTx").textContent = st.total_tx;
+  $("#contracts").textContent = st.contracts;
+}
+
+function renderChainViz() {
+  const box = $("#chainViz");
+  const latest = chain.slice(-40);
+  box.innerHTML = latest.map((b, i) => {
+    const link = i > 0 ? '<span class="chain-link">→</span>' : "";
+    return `${link}<div class="blk ${b.index === 0 ? 'genesis' : ''}" onclick="showBlock(${b.index})" title="#${b.index} ${b.hash}">
+      <div class="n">${b.index === 0 ? '创世' : '#' + b.index}</div>
+      <div class="t">${b.tx_count} tx</div>
+    </div>`;
+  }).join("");
+  box.scrollLeft = box.scrollWidth;
+}
+
+function renderBlockTable() {
+  $("#listHint").textContent = `（共 ${chain.length} 个区块，最新在前）`;
+  const rows = chain.slice().reverse().slice(0, 30);
+  $("#blockTable").innerHTML = `<div class="table-wrap"><table><thead><tr>
+    <th>高度</th><th>哈希</th><th>前一哈希</th><th>交易数</th><th>难度</th><th>Nonce</th><th>时间</th></tr></thead>
+    <tbody>${rows.map(b => `
+      <tr class="clickable" onclick="showBlock(${b.index})">
+        <td class="mono-num" style="color:var(--accent-2);">${b.index === 0 ? '创世' : '#' + b.index}</td>
+        <td class="hash">${fmt.hash(b.hash, 10)}</td>
+        <td class="hash">${fmt.hash(b.prev_hash, 8)}</td>
+        <td class="mono-num">${b.tx_count}</td>
+        <td class="mono-num">${b.difficulty}</td>
+        <td class="mono-num">${b.nonce}</td>
+        <td class="muted small">${fmt.ago(b.timestamp)}</td>
+      </tr>`).join("")}</tbody></table></div>`;
+}
+
+async function showBlock(identifier) {
+  const d = await API.get("/api/block/" + identifier);
+  if (!d.ok) return toast(d.error, "err");
+  const b = d.block;
+  const h = b.header;
+  $("#detailCard").style.display = "block";
+  $("#detailCard").innerHTML = `
+    <div class="flex"><h2 style="margin:0;">区块 #${h.index}</h2>
+      <div class="spacer"></div>
+      <button class="btn ghost sm" onclick="document.getElementById('detailCard').style.display='none'">关闭</button></div>
+    <div class="grid cols-2" style="margin-top:12px;">
+      <div><dl class="kv">
+        <dt>区块哈希</dt><dd class="hash">${esc(h.hash)}</dd>
+        <dt>前一哈希</dt><dd class="hash">${esc(h.prev_hash)}</dd>
+        <dt>时间戳</dt><dd>${fmt.time(h.timestamp)}</dd>
+        <dt>难度</dt><dd>${h.difficulty}</dd>
+      </dl></div>
+      <div><dl class="kv">
+        <dt>Nonce</dt><dd>${h.nonce}</dd>
+        <dt>交易数</dt><dd>${h.tx_count}</dd>
+        <dt>Merkle 根</dt><dd class="hash">${esc(h.merkle_root)}</dd>
+        <dt>状态根</dt><dd class="hash">${esc(h.state_root)}</dd>
+      </dl></div>
+    </div>
+    <div class="section-title">交易（${b.transactions.length}）</div>
+    <div class="table-wrap"><table><thead><tr>
+      <th>类型</th><th>交易ID</th><th>发送方</th><th>接收方</th><th>金额</th><th>手续费</th></tr></thead>
+      <tbody>${b.transactions.map(t => `
+        <tr class="clickable" onclick="showTx('${t.txid}')">
+          <td><span class="badge blue">${fmt.shortType(t.type)}</span></td>
+          <td class="hash">${fmt.hash(t.txid, 9)}</td>
+          <td class="addr">${fmt.addr(t.sender, 6)}</td>
+          <td class="addr">${t.to ? fmt.addr(t.to, 6) : "—"}</td>
+          <td class="mono-num">${fmt.amount(t.amount)}</td>
+          <td class="mono-num">${fmt.amount(t.fee)}</td>
+        </tr>`).join("")}</tbody></table></div>`;
+  $("#detailCard").scrollIntoView({ behavior: "smooth" });
+}
+
+async function showTx(txid) {
+  const d = await API.get("/api/tx/" + txid);
+  if (!d.ok) return toast(d.error, "err");
+  const t = d.transaction;
+  $("#detailCard").style.display = "block";
+  $("#detailCard").innerHTML = `
+    <div class="flex"><h2 style="margin:0;">交易 ${fmt.hash(t.txid, 12)}</h2>
+      <div class="spacer"></div>
+      <button class="btn ghost sm" onclick="showBlock(${d.block.index})">查看所在区块 #${d.block.index}</button></div>
+    <div class="grid cols-2" style="margin-top:12px;">
+      <div><dl class="kv">
+        <dt>交易ID</dt><dd class="hash">${esc(t.txid)}</dd>
+        <dt>类型</dt><dd><span class="badge blue">${fmt.shortType(t.type)}</span></dd>
+        <dt>所在区块</dt><dd>#${d.block.index}</dd>
+        <dt>时间</dt><dd>${fmt.time(t.timestamp)}</dd>
+      </dl></div>
+      <div><dl class="kv">
+        <dt>发送方</dt><dd class="addr">${esc(t.sender)}</dd>
+        <dt>接收方</dt><dd class="addr">${t.to ? esc(t.to) : "—"}</dd>
+        <dt>金额</dt><dd class="mono-num">${fmt.amount(t.amount)}</dd>
+        <dt>手续费</dt><dd class="mono-num">${fmt.amount(t.fee)}</dd>
+        <dt>Nonce</dt><dd>${t.nonce}</dd>
+      </dl></div>
+    </div>
+    ${t.data && Object.keys(t.data).length ? `
+      <div class="section-title">附加数据</div>
+      <pre class="code">${esc(JSON.stringify(t.data, null, 2))}</pre>` : ""}`;
+  $("#detailCard").scrollIntoView({ behavior: "smooth" });
+}
+
+async function doSearch() {
+  const q = $("#searchBox").value.trim();
+  if (!q) return;
+  if (/^\d+$/.test(q)) return showBlock(parseInt(q));
+  if (/^0x[a-fA-F0-9]{40}$/.test(q)) return showTx(q);
+  if (/^[a-fA-F0-9]{64}$/.test(q)) {
+    const d = await API.get("/api/tx/" + q);
+    if (d.ok) return showTx(q);
+    return showBlock(q);
+  }
+  toast("无法识别的查询，请输入高度、区块哈希或交易ID", "err");
+}
+
+document.addEventListener("DOMContentLoaded", init);
+</script>
+</body>
+</html>

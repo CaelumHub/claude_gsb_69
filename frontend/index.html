@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>钱包管理 · LightChain</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside id="sidebar"></aside>
+  <div class="main">
+    <header id="topbar"></header>
+    <main class="content">
+      <div class="page-head">
+        <h1>钱包管理</h1>
+        <p>生成 ECDSA(secp256k1) 密钥对、查询余额、签名消息，管理本地钱包。</p>
+      </div>
+
+      <div class="grid cols-3" style="grid-template-columns: 1fr 1.4fr;">
+        <div class="card">
+          <h2>本地钱包 <span class="hint" id="walletCount"></span></h2>
+          <div class="flex" style="margin-bottom:12px;">
+            <button class="btn primary" onclick="createWallet()">🔑 生成密钥对</button>
+            <button class="btn ghost" onclick="showImport()">导入</button>
+          </div>
+          <div id="importBox" style="display:none; margin-bottom:12px;">
+            <div class="field"><label>私钥 (hex)</label>
+              <input id="importKey" class="mono" placeholder="64 位十六进制私钥"></div>
+            <div class="field"><label>标签</label>
+              <input id="importLabel" placeholder="可选"></div>
+            <button class="btn green sm" onclick="doImport()">导入钱包</button>
+          </div>
+          <div id="walletList" class="table-wrap" style="max-height:520px; overflow:auto;">
+            <table><thead><tr><th>标签</th><th>地址</th><th>余额</th></tr></thead>
+              <tbody id="walletRows"></tbody></table>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>钱包详情</h2>
+          <div id="walletDetail"><div class="empty"><div class="big">🔑</div>选择或生成一个钱包</div></div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <h2>签名工具</h2>
+        <div class="row">
+          <div class="field grow"><label>消息内容</label>
+            <input id="signMsg" placeholder="输入任意文本进行签名"></div>
+          <div class="field"><label>使用钱包</label>
+            <select id="signWallet"></select></div>
+          <div class="field"><button class="btn primary" onclick="doSign()">✍ 签名</button></div>
+        </div>
+        <div id="signResult" style="display:none; margin-top:8px;"></div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <h2>关联交易 <span class="hint" id="txHint"></span></h2>
+        <div id="txList"><div class="empty">选择钱包查看其交易记录</div></div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<script src="/static/js/api.js"></script>
+<script src="/static/js/app.js"></script>
+<script>
+window.PAGE = "wallet";
+let selected = null;
+let wallets = [];
+
+async function loadWallets() {
+  const d = await API.get("/api/wallet/list");
+  wallets = d.wallets;
+  $("#walletCount").textContent = `（${wallets.length}）`;
+  const tbody = $("#walletRows");
+  if (!wallets.length) {
+    tbody.innerHTML = `<tr><td colspan="3" class="zero">暂无钱包</td></tr>`;
+  } else {
+    tbody.innerHTML = wallets.map((w, i) => `
+      <tr class="clickable" onclick="selectWallet(${i})">
+        <td>${esc(w.label || "—")}</td>
+        <td class="addr">${fmt.addr(w.address, 6)}</td>
+        <td class="mono-num">${fmt.amount(w.balance)}</td>
+      </tr>`).join("");
+  }
+  refreshSignSelect();
+}
+
+function selectWallet(i) {
+  selected = wallets[i];
+  renderDetail();
+  loadTxs();
+}
+
+function refreshSignSelect() {
+  const sel = $("#signWallet");
+  sel.innerHTML = wallets.map((w, i) =>
+    `<option value="${i}">${esc(w.label || fmt.addr(w.address, 6))}</option>`).join("");
+}
+
+async function renderDetail() {
+  const box = $("#walletDetail");
+  if (!selected) { box.innerHTML = `<div class="empty">选择或生成一个钱包</div>`; return; }
+  const d = await API.get("/api/wallet/" + selected.address);
+  box.innerHTML = `
+    <dl class="kv">
+      <dt>地址</dt><dd class="addr">${esc(selected.address)}</dd>
+      <dt>标签</dt><dd>${esc(selected.label || "—")}</dd>
+      <dt>余额</dt><dd class="mono-num" style="font-size:22px;font-weight:700;color:var(--green);">${fmt.amount(d.balance)} <span class="small muted">LC</span></dd>
+      <dt>Nonce</dt><dd>${d.nonce}</dd>
+      <dt>公钥</dt><dd class="hash">${esc(selected.public_key)}</dd>
+      <dt>本地</dt><dd>${d.local ? '<span class="badge green">是</span>' : '<span class="badge gray">否</span>'}</dd>
+    </dl>
+    <hr class="divider">
+    <div class="flex">
+      <button class="btn green" onclick="fundWallet()">💰 挖矿获取测试币 (+${'50'})</button>
+      <button class="btn ghost" onclick="copyText('${esc(selected.address)}')">复制地址</button>
+      <button class="btn danger" onclick="exportKey()">导出私钥</button>
+    </div>`;
+}
+
+async function createWallet() {
+  const label = prompt("钱包标签（可选）：") || "";
+  const d = await API.post("/api/wallet/create", { label });
+  toast("已生成钱包 " + fmt.addr(d.address), "ok");
+  await loadWallets();
+  selected = wallets.find(w => w.address === d.address);
+  renderDetail();
+}
+
+function showImport() { $("#importBox").style.display = $("#importBox").style.display === "none" ? "block" : "none"; }
+
+async function doImport() {
+  const d = await API.post("/api/wallet/import",
+    { private_key: $("#importKey").value.trim(), label: $("#importLabel").value });
+  toast("已导入 " + fmt.addr(d.address), "ok");
+  $("#importBox").style.display = "none";
+  await loadWallets();
+}
+
+async function fundWallet() {
+  if (!selected) return toast("请先选择钱包", "err");
+  const d = await API.post("/api/mine", { miner: selected.address });
+  toast(d.ok ? `出块 #${d.height}，奖励已到账` : ("出块失败: " + d.message), d.ok ? "ok" : "err");
+  await loadWallets();
+  renderDetail();
+  renderTopbar();
+}
+
+async function doSign() {
+  const idx = Number($("#signWallet").value);
+  if (isNaN(idx) || !wallets[idx]) return toast("请选择钱包", "err");
+  const msg = $("#signMsg").value;
+  if (!msg) return toast("请输入消息", "err");
+  const d = await API.post("/api/wallet/sign", { address: wallets[idx].address, message: msg });
+  if (d.ok) {
+    $("#signResult").style.display = "block";
+    $("#signResult").innerHTML = `
+      <div class="kv">
+        <dt>消息哈希</dt><dd class="hash">${d.message_hash}</dd>
+        <dt>签名</dt><dd class="hash" style="color:var(--purple);">${esc(d.signature)}</dd>
+      </div>`;
+    toast("签名完成", "ok");
+  } else toast(d.error, "err");
+}
+
+async function exportKey() {
+  if (!selected) return;
+  if (!confirm("警告：私钥将明文显示，切勿泄露。继续？")) return;
+  const d = await API.get(`/api/wallet/${selected.address}/export`);
+  prompt("私钥（请妥善保管）：", d.private_key);
+}
+
+async function loadTxs() {
+  if (!selected) return;
+  $("#txHint").textContent = selected.address;
+  const d = await API.get(`/api/wallet/${selected.address}/transactions`);
+  const box = $("#txList");
+  if (!d.transactions.length) { box.innerHTML = `<div class="empty">该地址暂无交易</div>`; return; }
+  box.innerHTML = `<div class="table-wrap"><table><thead><tr>
+    <th>高度</th><th>类型</th><th>交易ID</th><th>金额</th><th>方向</th><th>时间</th></tr></thead>
+    <tbody>${d.transactions.map(t => {
+      const out = t.from === selected.address;
+      return `<tr>
+        <td class="mono-num">#${t.height}</td>
+        <td><span class="badge blue">${fmt.shortType(t.type)}</span></td>
+        <td class="hash">${fmt.hash(t.txid, 8)}</td>
+        <td class="mono-num">${fmt.amount(t.amount)}</td>
+        <td>${out ? '<span class="badge amber">转出</span>' : '<span class="badge green">转入</span>'}</td>
+        <td class="muted small">${fmt.ago(t.timestamp)}</td>
+      </tr>`; }).join("")}</tbody></table></div>`;
+}
+
+function copyText(s) {
+  navigator.clipboard.writeText(s).then(() => toast("已复制", "ok"));
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  loadWallets();
+  pollStatus(5000);
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>交易池与打包 · LightChain</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside id="sidebar"></aside>
+  <div class="main">
+    <header id="topbar"></header>
+    <main class="content">
+      <div class="page-head">
+        <h1>交易池与打包</h1>
+        <p>构造交易、查看未确认交易池，并通过挖矿将交易打包进区块。</p>
+      </div>
+
+      <div class="grid cols-4">
+        <div class="card stat accent"><div class="label">待确认交易</div>
+          <div class="value" id="poolCount">—</div></div>
+        <div class="card stat green"><div class="label">当前区块高度</div>
+          <div class="value" id="height">—</div></div>
+        <div class="card stat amber"><div class="label">当前难度</div>
+          <div class="value" id="difficulty">—</div></div>
+        <div class="card stat purple"><div class="label">算力 (hash/s)</div>
+          <div class="value" id="hashrate">—</div></div>
+      </div>
+
+      <div class="grid" style="grid-template-columns: 1.2fr 1fr; margin-top:16px;">
+        <div class="card">
+          <h2>构造转账交易</h2>
+          <div class="field"><label>发送方（本地钱包）</label>
+            <select id="txFrom"></select></div>
+          <div class="field"><label>接收方地址</label>
+            <input id="txTo" class="mono" placeholder="0x…"></div>
+          <div class="row">
+            <div class="field"><label>金额</label><input id="txAmount" type="number" min="0" step="any" value="1"></div>
+            <div class="field"><label>手续费</label><input id="txFee" type="number" min="0" step="any" value="0"></div>
+          </div>
+          <button class="btn primary" onclick="submitTransfer()">📤 提交到交易池</button>
+          <div class="hint" style="margin-top:8px;">交易需矿工打包后才会写入区块链。</div>
+        </div>
+
+        <div class="card">
+          <h2>挖矿控制</h2>
+          <div class="flex" style="margin-bottom:10px;">
+            <button class="btn green" onclick="mineNow()">⛏ 立即出块</button>
+            <button class="btn" id="autoMineBtn" onclick="toggleAutoMine()">▶ 开始自动挖矿</button>
+          </div>
+          <div id="mineStatus" class="small muted"></div>
+          <hr class="divider">
+          <div class="kv">
+            <dt>出块奖励</dt><dd>50 LC</dd>
+            <dt>每块交易上限</dt><dd id="maxTx">—</dd>
+            <dt>挖矿间隔</dt><dd id="mineInterval">—</dd>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="flex">
+          <h2 style="margin:0;">交易池 <span class="hint" id="poolHint"></span></h2>
+          <div class="spacer"></div>
+          <button class="btn danger sm" onclick="clearPool()">清空交易池</button>
+          <button class="btn ghost sm" onclick="refreshPool()">刷新</button>
+        </div>
+        <div id="poolList" class="table-wrap" style="margin-top:12px;"></div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<script src="/static/js/api.js"></script>
+<script src="/static/js/app.js"></script>
+<script>
+window.PAGE = "txpool";
+let wallets = [];
+
+async function init() {
+  await loadWallets();
+  await refreshPool();
+  await loadConfig();
+  pollStatus(4000);
+}
+
+async function loadWallets() {
+  const d = await API.get("/api/wallet/list");
+  wallets = d.wallets;
+  $("#txFrom").innerHTML = wallets.map((w, i) =>
+    `<option value="${i}">${esc(w.label || fmt.addr(w.address, 6))} (${fmt.amount(w.balance)})</option>`).join("");
+}
+
+async function refreshPool() {
+  const d = await API.get("/api/txpool");
+  const s = await API.get("/api/node/status");
+  $("#poolCount").textContent = d.count;
+  $("#height").textContent = "#" + s.height;
+  $("#difficulty").textContent = s.difficulty;
+  $("#hashrate").textContent = Math.round(s.hashrate).toLocaleString();
+  $("#poolHint").textContent = `（${d.count} 条）`;
+  const box = $("#poolList");
+  if (!d.count) {
+    box.innerHTML = `<div class="empty"><div class="big">🗂</div>交易池为空</div>`;
+    return;
+  }
+  box.innerHTML = `<table><thead><tr>
+    <th>交易ID</th><th>类型</th><th>发送方</th><th>接收方</th><th>金额</th><th>手续费</th><th>Nonce</th><th></th></tr></thead>
+    <tbody>${d.transactions.map(t => `
+      <tr>
+        <td class="hash" title="${esc(t.txid)}">${fmt.hash(t.txid, 8)}</td>
+        <td><span class="badge blue">${fmt.shortType(t.type)}</span></td>
+        <td class="addr">${fmt.addr(t.sender, 6)}</td>
+        <td class="addr">${t.to ? fmt.addr(t.to, 6) : "—"}</td>
+        <td class="mono-num">${fmt.amount(t.amount)}</td>
+        <td class="mono-num">${fmt.amount(t.fee)}</td>
+        <td class="mono-num">${t.nonce}</td>
+        <td><button class="btn ghost sm" onclick="removeTx('${t.txid}')">移除</button></td>
+      </tr>`).join("")}</tbody></table>`;
+}
+
+async function submitTransfer() {
+  const idx = Number($("#txFrom").value);
+  if (!wallets[idx]) return toast("请先生成钱包", "err");
+  const from = wallets[idx].address;
+  const to = $("#txTo").value.trim();
+  const amount = parseFloat($("#txAmount").value);
+  const fee = parseFloat($("#txFee").value || 0);
+  if (!to.startsWith("0x") || to.length !== 42) return toast("接收方地址格式错误", "err");
+  if (!(amount > 0)) return toast("金额必须为正", "err");
+  try {
+    const d = await API.post("/api/tx/transfer", { from, to, amount, fee });
+    toast(d.ok ? "交易已提交: " + fmt.hash(d.txid, 8) : d.reason, d.ok ? "ok" : "err");
+    await refreshPool();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function mineNow() {
+  const d = await API.post("/api/mine", {});
+  toast(d.ok ? `出块 #${d.height}` : ("出块失败: " + d.message), d.ok ? "ok" : "err");
+  await refreshPool();
+  renderTopbar();
+}
+
+async function toggleAutoMine() {
+  const s = await API.get("/api/mining/status");
+  if (s.mining) {
+    await API.post("/api/mining/stop");
+    toast("自动挖矿已停止", "info");
+  } else {
+    await API.post("/api/mining/start");
+    toast("自动挖矿已启动", "ok");
+  }
+  refreshMineStatus();
+}
+
+async function refreshMineStatus() {
+  const s = await API.get("/api/mining/status");
+  $("#autoMineBtn").textContent = s.mining ? "⏸ 停止自动挖矿" : "▶ 开始自动挖矿";
+  $("#mineStatus").textContent = s.mining
+    ? `自动挖矿运行中 · 最近一次 ${fmt.dur(s.last_duration)} · ${s.last_attempts} 次哈希`
+    : "自动挖矿已停止";
+}
+
+async function loadConfig() {
+  const c = await API.get("/api/network/config");
+  $("#maxTx").textContent = c.max_tx_per_block;
+  $("#mineInterval").textContent = c.mining_interval + " s";
+  await refreshMineStatus();
+}
+
+async function removeTx(txid) { await API.del("/api/txpool/" + txid); refreshPool(); }
+async function clearPool() { if (confirm("清空交易池？")) { await API.post("/api/txpool/clear"); refreshPool(); } }
+
+document.addEventListener("DOMContentLoaded", init);
+</script>
+</body>
+</html>

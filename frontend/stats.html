@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>统计报表 · LightChain</title>
+<link rel="stylesheet" href="/static/css/style.css">
+<style>
+  .chart-box { width: 100%; }
+  .chart-box svg { width: 100%; height: auto; display: block; }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; }
+  .legend .sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; margin-right: 6px; vertical-align: -1px; }
+  .rank-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+  .rank-bar { height: 8px; border-radius: 4px; background: var(--accent); }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside id="sidebar"></aside>
+  <div class="main">
+    <header id="topbar"></header>
+    <main class="content">
+      <div class="page-head">
+        <h1>统计报表</h1>
+        <p>全网吞吐、难度走势、交易构成与持仓分布。</p>
+      </div>
+
+      <div class="grid cols-4">
+        <div class="card stat accent"><div class="label">区块总数</div><div class="value" id="blocks">—</div></div>
+        <div class="card stat green"><div class="label">累计交易</div><div class="value" id="totalTx">—</div></div>
+        <div class="card stat amber"><div class="label">账户数</div><div class="value" id="accounts">—</div></div>
+        <div class="card stat purple"><div class="label">合约数</div><div class="value" id="contracts">—</div></div>
+      </div>
+
+      <div class="grid" style="grid-template-columns: 1fr 1.2fr; margin-top:16px;">
+        <div class="card">
+          <h2>交易类型构成</h2>
+          <div id="txBreakdown" style="margin-top:12px;"></div>
+          <div class="kv" style="margin-top:12px;">
+            <dt>平均出块间隔</dt><dd class="mono-num" id="avgInterval">—</dd>
+            <dt>当前算力</dt><dd class="mono-num" id="hashrate">—</dd>
+            <dt>累计工作量</dt><dd class="mono-num" id="chainwork">—</dd>
+            <dt>待确认交易</dt><dd class="mono-num" id="txpool">—</dd>
+          </div>
+        </div>
+        <div class="card">
+          <h2>持仓 TOP 地址</h2>
+          <div id="topAddresses" style="margin-top:12px;"></div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <h2>难度走势 <span class="hint">（每 5 块按出块速度自动调整）</span></h2>
+        <div class="chart-box" id="difficultyChart"></div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <h2>每块交易数 <span class="hint">（吞吐量）</span></h2>
+        <div class="chart-box" id="throughputChart"></div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<script src="/static/js/api.js"></script>
+<script src="/static/js/app.js"></script>
+<script>
+window.PAGE = "stats";
+const PALETTE = { transfer: "#4f8cff", deploy: "#a06cff", call: "#33c9a0", coinbase: "#f0b429" };
+
+async function init() {
+  await loadAll();
+  pollStatus(12000);
+}
+
+async function loadAll() {
+  const [o, d, t] = await Promise.all([
+    API.get("/api/stats/overview"),
+    API.get("/api/stats/difficulty"),
+    API.get("/api/stats/throughput"),
+  ]);
+  renderOverview(o);
+  renderBreakdown(o);
+  renderTop(o.top_addresses);
+  renderDifficulty(d.series);
+  renderThroughput(t.series);
+}
+
+function renderOverview(o) {
+  $("#blocks").textContent = o.total_blocks;
+  $("#totalTx").textContent = o.total_tx;
+  $("#accounts").textContent = o.accounts;
+  $("#contracts").textContent = o.contracts;
+  $("#avgInterval").textContent = o.avg_block_interval + " s";
+  $("#hashrate").textContent = Math.round(o.hashrate).toLocaleString() + " H/s";
+  $("#chainwork").textContent = (o.chainwork || 0).toLocaleString();
+  $("#txpool").textContent = o.txpool;
+}
+
+function renderBreakdown(o) {
+  const coinbase = o.total_blocks; // one coinbase per block
+  const counts = {
+    transfer: o.transfers, deploy: o.deploys, call: o.calls, coinbase,
+  };
+  const total = Object.values(counts).reduce((a, b) => a + b, 0) || 1;
+  $("#txBreakdown").innerHTML = Object.entries(counts).map(([k, v]) => `
+    <div style="margin:10px 0;">
+      <div class="flex">
+        <span><span class="sw" style="background:${PALETTE[k]};"></span>${fmt.shortType(k)}</span>
+        <span class="spacer"></span>
+        <span class="mono-num">${v}（${(v / total * 100).toFixed(1)}%）</span>
+      </div>
+      <div style="height:8px;background:var(--panel-2);border-radius:4px;margin-top:4px;">
+        <div style="height:8px;border-radius:4px;background:${PALETTE[k]};width:${(v / total * 100).toFixed(1)}%;"></div>
+      </div>
+    </div>`).join("");
+}
+
+function renderTop(addrs) {
+  const box = $("#topAddresses");
+  if (!addrs.length) { box.innerHTML = `<div class="empty">暂无账户</div>`; return; }
+  const max = addrs[0].balance || 1;
+  box.innerHTML = addrs.map((a, i) => `
+    <div class="rank-row">
+      <span class="muted mono" style="min-width:22px;">${i + 1}</span>
+      <span class="addr" style="min-width:120px;" title="${esc(a.address)}">${fmt.addr(a.address, 5)}</span>
+      <div class="spacer"></div>
+      <span class="mono-num">${fmt.amount(a.balance)} LC</span>
+    </div>`).join("");
+}
+
+function renderDifficulty(series) {
+  $("#difficultyChart").innerHTML = lineChart(series, {
+    x: d => d.index, y: d => d.difficulty,
+    color: "#a06cff", yLabel: "难度", fill: true,
+  });
+}
+
+function renderThroughput(series) {
+  $("#throughputChart").innerHTML = barChart(series, {
+    x: d => d.index, y: d => d.tx_count,
+    color: "#4f8cff", yLabel: "交易数",
+  });
+}
+
+/* ---------- tiny inline SVG chart helpers ---------- */
+function chartScales(data, gx, gy, W, H, pad) {
+  const xs = data.map(gx), ys = data.map(gy);
+  const xMin = Math.min(...xs), xMax = Math.max(...xs);
+  const yMax = Math.max(...ys) * 1.1 || 1;
+  const x = v => pad.l + (W - pad.l - pad.r) * ((v - xMin) / (xMax - xMin || 1));
+  const y = v => pad.t + (H - pad.t - pad.b) * (1 - v / yMax);
+  return { x, y, xMin, xMax, yMax };
+}
+
+function gridLines(W, H, pad, yMax, xMax, xMin, step) {
+  let g = "";
+  const n = 4;
+  for (let i = 0; i <= n; i++) {
+    const yy = pad.t + (H - pad.t - pad.b) * (i / n);
+    const val = yMax * (1 - i / n);
+    g += `<line x1="${pad.l}" y1="${yy}" x2="${W - pad.r}" y2="${yy}" stroke="var(--border)" stroke-width="1"/>`;
+    g += `<text x="${pad.l - 6}" y="${yy + 4}" text-anchor="end" font-size="9" fill="var(--faint)">${val >= 100 ? Math.round(val) : val.toFixed(1)}</text>`;
+  }
+  g += `<text x="${pad.l}" y="${H - 6}" font-size="9" fill="var(--faint)">${xMin}</text>`;
+  g += `<text x="${W - pad.r}" y="${H - 6}" text-anchor="end" font-size="9" fill="var(--faint)">${xMax}</text>`;
+  return g;
+}
+
+function lineChart(data, { x: gx, y: gy, color, fill }) {
+  if (!data.length) return `<div class="empty">暂无数据</div>`;
+  const W = 600, H = 210, pad = { l: 46, r: 14, t: 14, b: 26 };
+  const s = chartScales(data, gx, gy, W, H, pad);
+  const pts = data.map(d => `${s.x(gx(d)).toFixed(1)},${s.y(gy(d)).toFixed(1)}`).join(" ");
+  const area = `${pad.l},${H - pad.b} ${pts} ${s.x(gx(data[data.length - 1])).toFixed(1)},${H - pad.b}`;
+  return `<svg viewBox="0 0 ${W} ${H}">
+    ${gridLines(W, H, pad, s.yMax, s.xMax, s.xMin)}
+    ${fill ? `<polygon points="${area}" fill="${color}" opacity="0.12"/>` : ""}
+    <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round"/>
+    ${data.map(d => `<circle cx="${s.x(gx(d)).toFixed(1)}" cy="${s.y(gy(d)).toFixed(1)}" r="2.4" fill="${color}"/>`).join("")}
+  </svg>`;
+}
+
+function barChart(data, { x: gx, y: gy, color }) {
+  if (!data.length) return `<div class="empty">暂无数据</div>`;
+  const W = 600, H = 210, pad = { l: 46, r: 14, t: 14, b: 26 };
+  const s = chartScales(data, gx, gy, W, H, pad);
+  const bw = Math.max(3, (W - pad.l - pad.r) / data.length * 0.6);
+  const bars = data.map(d => {
+    const bx = s.x(gx(d)) - bw / 2;
+    const by = s.y(gy(d));
+    return `<rect x="${bx.toFixed(1)}" y="${by.toFixed(1)}" width="${bw.toFixed(1)}" height="${(H - pad.b - by).toFixed(1)}" fill="${color}" rx="1.5"/>`;
+  }).join("");
+  return `<svg viewBox="0 0 ${W} ${H}">
+    ${gridLines(W, H, pad, s.yMax, s.xMax, s.xMin)}
+    ${bars}
+  </svg>`;
+}
+
+document.addEventListener("DOMContentLoaded", init);
+</script>
+</body>
+</html>

@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>网络设置 · LightChain</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside id="sidebar"></aside>
+  <div class="main">
+    <header id="topbar"></header>
+    <main class="content">
+      <div class="page-head">
+        <h1>网络设置</h1>
+        <p>配置 API 接入点、P2P 邻居节点与共识/挖矿参数，并触发链同步。</p>
+      </div>
+
+      <div class="grid" style="grid-template-columns: 1fr 1fr; margin-top:0;">
+        <div class="card">
+          <h2>API 接入点</h2>
+          <p class="hint" style="margin:6px 0;">当前 UI 通过此地址访问节点 API（多节点时可切换）。</p>
+          <div class="row">
+            <div class="field grow"><label>当前 API 基础地址</label>
+              <input id="apiBase" class="mono" placeholder="http://127.0.0.1:8000"></div>
+          </div>
+          <div class="flex">
+            <button class="btn primary" onclick="applyBase()">保存并重载</button>
+            <button class="btn ghost" onclick="resetBase()">恢复默认（当前源）</button>
+          </div>
+          <div class="hint" style="margin-top:10px;">默认使用页面所在源；多节点演示时可在 8000 / 8001 / 8002 之间切换。</div>
+        </div>
+
+        <div class="card">
+          <h2>节点配置</h2>
+          <dl class="kv" id="configInfo"></dl>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <div class="flex">
+          <h2 style="margin:0;">P2P 邻居节点</h2>
+          <div class="spacer"></div>
+          <button class="btn ghost sm" onclick="loadPeers()">刷新</button>
+        </div>
+        <div class="row" style="margin-top:12px;">
+          <div class="field"><label>主机</label><input id="peerHost" class="mono" value="127.0.0.1"></div>
+          <div class="field"><label>端口</label><input id="peerPort" type="number" value="8001" style="max-width:120px;"></div>
+          <div class="field" style="align-self:flex-end;">
+            <button class="btn green" onclick="addPeer()">➕ 添加邻居</button></div>
+        </div>
+        <div id="peerTable" class="table-wrap" style="margin-top:12px;"></div>
+      </div>
+
+      <div class="grid" style="grid-template-columns: 1fr 1fr; margin-top:16px;">
+        <div class="card">
+          <h2>共识 / 挖矿参数</h2>
+          <div class="field"><label>挖矿间隔（秒）</label>
+            <input id="miningInterval" type="number" min="0.2" step="0.1"></div>
+          <div class="field"><label>自动挖矿</label>
+            <select id="autoMine"><option value="1">开启</option><option value="0">关闭</option></select></div>
+          <button class="btn primary" onclick="saveParams()">保存参数</button>
+          <div class="hint" style="margin-top:10px;">难度调整、出块奖励等核心共识参数由后端 config 固定，保证全网一致。</div>
+        </div>
+
+        <div class="card">
+          <h2>链同步</h2>
+          <p class="hint" style="margin:6px 0;">向邻居拉取最重链，落后节点将补齐区块，冲突时触发重组。</p>
+          <button class="btn green" onclick="syncNow()">🔄 立即同步</button>
+          <div id="syncResult" style="margin-top:12px;"></div>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<script src="/static/js/api.js"></script>
+<script src="/static/js/app.js"></script>
+<script>
+window.PAGE = "network";
+
+async function init() {
+  $("#apiBase").value = API.base();
+  await loadConfig();
+  await loadPeers();
+  pollStatus(8000);
+}
+
+async function loadConfig() {
+  const c = await API.get("/api/network/config");
+  $("#configInfo").innerHTML = `
+    <dt>节点 ID</dt><dd class="mono">${esc(c.node_id)}</dd>
+    <dt>监听地址</dt><dd class="mono">${esc(c.host)}:${c.port}</dd>
+    <dt>数据目录</dt><dd class="mono">${esc(c.data_dir)}</dd>
+    <dt>初始难度</dt><dd class="mono-num">${c.initial_difficulty}</dd>
+    <dt>出块奖励</dt><dd class="mono-num">${c.coinbase_reward} LC</dd>
+    <dt>每块交易上限</dt><dd class="mono-num">${c.max_tx_per_block}</dd>
+    <dt>沙箱超时</dt><dd class="mono-num">${c.sandbox_timeout} s</dd>`;
+  $("#miningInterval").value = c.mining_interval;
+  $("#autoMine").value = c.mining ? "1" : "0";
+}
+
+async function loadPeers() {
+  const d = await API.get("/api/network/peers");
+  const box = $("#peerTable");
+  if (!d.peers.length) {
+    box.innerHTML = `<div class="empty">尚未添加邻居节点</div>`;
+    return;
+  }
+  box.innerHTML = `<table><thead><tr>
+    <th>节点 ID</th><th>地址</th><th>状态</th><th>高度</th><th></th></tr></thead>
+    <tbody>${d.peers.map(p => `
+      <tr>
+        <td class="mono">${esc(p.id)}</td>
+        <td class="mono">${esc(p.url)}</td>
+        <td><span class="badge ${p.status === 'up' ? 'green' : 'gray'}">${p.status}</span></td>
+        <td class="mono-num">${p.height ?? '—'}</td>
+        <td><button class="btn danger sm" onclick="removePeer('${p.host}',${p.port})">移除</button></td>
+      </tr>`).join("")}</tbody></table>`;
+}
+
+function applyBase() {
+  const v = $("#apiBase").value.trim();
+  if (!/^https?:\/\//.test(v)) return toast("地址需以 http:// 或 https:// 开头", "err");
+  localStorage.setItem("lc_api_base", v.replace(/\/$/, ""));
+  toast("已保存 API 地址，正在重载…", "ok");
+  setTimeout(() => location.reload(), 500);
+}
+
+function resetBase() {
+  localStorage.removeItem("lc_api_base");
+  toast("已恢复默认 API 地址", "info");
+  setTimeout(() => location.reload(), 500);
+}
+
+async function addPeer() {
+  const host = $("#peerHost").value.trim() || "127.0.0.1";
+  const port = parseInt($("#peerPort").value);
+  if (!port) return toast("端口无效", "err");
+  const d = await API.post("/api/network/add_peer", { host, port });
+  toast(d.ok ? "已添加邻居 " + host + ":" + port : d.error, d.ok ? "ok" : "err");
+  await loadPeers();
+}
+
+async function removePeer(host, port) {
+  const d = await API.post("/api/network/remove_peer", { host, port });
+  toast(d.ok ? "已移除邻居" : "移除失败", d.ok ? "ok" : "err");
+  await loadPeers();
+}
+
+async function saveParams() {
+  const mining_interval = parseFloat($("#miningInterval").value);
+  const auto_mine = $("#autoMine").value === "1";
+  const d = await API.post("/api/network/config", { mining_interval, auto_mine });
+  toast("已保存: " + (d.changed.length ? d.changed.join(", ") : "无变化"), "ok");
+  await loadConfig();
+}
+
+async function syncNow() {
+  const d = await API.post("/api/network/sync");
+  const s = d.summary;
+  $("#syncResult").innerHTML = `
+    <dl class="kv">
+      <dt>检查邻居</dt><dd>${s.checked} 个</dd>
+      <dt>补齐区块</dt><dd>${s.synced_blocks} 个</dd>
+      <dt>触发重组</dt><dd>${s.reorgs} 次</dd>
+      <dt>最优邻居</dt><dd>${esc(s.best_peer || "无")}</dd>
+      ${s.errors.length ? `<dt>错误</dt><dd class="muted">${s.errors.map(esc).join("; ")}</dd>` : ""}
+    </dl>`;
+  renderTopbar();
+}
+
+document.addEventListener("DOMContentLoaded", init);
+</script>
+</body>
+</html>

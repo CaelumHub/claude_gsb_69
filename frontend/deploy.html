@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>智能合约部署 · LightChain</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside id="sidebar"></aside>
+  <div class="main">
+    <header id="topbar"></header>
+    <main class="content">
+      <div class="page-head">
+        <h1>智能合约部署</h1>
+        <p>编写受限 Python 子集合约，校验后部署上链（部署即创建一笔 deploy 交易）。</p>
+      </div>
+
+      <div class="grid" style="grid-template-columns: 1.4fr 1fr;">
+        <div class="card">
+          <div class="flex">
+            <h2 style="margin:0;">合约代码</h2>
+            <div class="spacer"></div>
+            <button class="btn ghost sm" onclick="loadTemplate()">📚 从模板载入</button>
+            <button class="btn primary sm" onclick="validateCode()">✓ 校验语法</button>
+          </div>
+          <div class="hint" style="margin:8px 0;">合约使用 <code>state</code>、<code>msg</code>、<code>emit</code>、<code>require</code>、<code>transfer</code> 等受限 API，禁止 import / IO / 网络。</div>
+          <div id="editor" class="editor" contenteditable="true" spellcheck="false" style="min-height:360px;"># 在此编写合约代码
+def init():
+    state["owner"] = msg.sender
+    state["count"] = 0
+    emit("Created", by=msg.sender)
+
+def increment():
+    state["count"] = state.get("count", 0) + 1
+    emit("Incremented", value=state["count"])
+
+def get():
+    return state.get("count", 0)
+</div>
+          <div id="validateResult" style="margin-top:8px;"></div>
+        </div>
+
+        <div class="card">
+          <h2>部署参数</h2>
+          <div class="field"><label>部署账户（本地钱包）</label>
+            <select id="deployFrom"></select></div>
+          <div class="field"><label>构造参数 (JSON 数组，传给 init)</label>
+            <input id="constructor" class="mono" placeholder='例如 ["MyToken","MT",1000]'></div>
+          <div class="field"><label>手续费</label>
+            <input id="deployFee" type="number" min="0" step="any" value="0"></div>
+          <button class="btn green" onclick="deploy()" style="width:100%;">🚀 部署合约</button>
+          <div class="hint" style="margin-top:10px;">部署后合约地址由交易ID确定性推导，可在「合约交互」页面调用。</div>
+          <hr class="divider">
+          <div class="section-title">沙箱安全模型</div>
+          <div class="small muted" style="line-height:1.9;">
+            · AST 静态校验：拒绝 import / dunder 逃逸 / 危险内置<br>
+            · 受限内置函数白名单（无 open/eval/exec）<br>
+            · 指令预算：终止死循环与计算爆炸<br>
+            · 输出上限：限制 print 输出体积<br>
+            · 状态值 JSON 可序列化 + 键数量上限
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top:16px;">
+        <h2>已部署合约 <span class="hint" id="contractHint"></span></h2>
+        <div id="contractList"></div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<script src="/static/js/api.js"></script>
+<script src="/static/js/app.js"></script>
+<script>
+window.PAGE = "deploy";
+let wallets = [];
+
+async function init() {
+  await loadWallets();
+  await loadContracts();
+  const pending = localStorage.getItem("lc_deploy_template");
+  if (pending) {
+    localStorage.removeItem("lc_deploy_template");
+    autoLoadTemplate(pending);
+  }
+  pollStatus(6000);
+}
+
+async function autoLoadTemplate(name) {
+  try {
+    const t = await API.get("/api/templates/" + name);
+    $("#editor").textContent = t.template.source;
+    const ctor = t.template.constructor;
+    if (ctor.length) {
+      $("#constructor").value = "[" + ctor.map(c =>
+        c.type === "int" ? "0" : '""').join(",") + "]";
+      $("#constructor").title = "参数: " + ctor.map(c => c.name).join(", ");
+    } else $("#constructor").value = "[]";
+    toast("已载入模板: " + t.template.title, "ok");
+  } catch (e) { toast("模板载入失败", "err"); }
+}
+
+async function loadWallets() {
+  const d = await API.get("/api/wallet/list");
+  wallets = d.wallets;
+  $("#deployFrom").innerHTML = wallets.map((w, i) =>
+    `<option value="${i}">${esc(w.label || fmt.addr(w.address, 6))} (${fmt.amount(w.balance)})</option>`).join("");
+}
+
+function code() { return $("#editor").textContent; }
+
+async function validateCode() {
+  const d = await API.post("/api/contract/validate", { code: code() });
+  $("#validateResult").innerHTML = d.ok
+    ? `<span class="badge green">✓ 语法与安全校验通过</span>`
+    : `<span class="badge red">✗ ${esc(d.message)}</span>`;
+}
+
+async function loadTemplate() {
+  const d = await API.get("/api/templates");
+  const names = d.templates.map(t => t.name + " — " + t.title);
+  const idx = await chooseFrom(names);
+  if (idx == null) return;
+  const name = d.templates[idx].name;
+  const t = await API.get("/api/templates/" + name);
+  $("#editor").textContent = t.template.source;
+  const ctor = t.template.constructor;
+  if (ctor.length) {
+    $("#constructor").value = "[" + ctor.map(c =>
+      c.type === "int" ? "0" : '""').join(",") + "]";
+    $("#constructor").title = "参数: " + ctor.map(c => c.name).join(", ");
+  } else $("#constructor").value = "[]";
+  toast("已载入模板: " + t.template.title, "ok");
+}
+
+function chooseFrom(items) {
+  return new Promise((resolve) => {
+    const n = prompt("选择模板（输入序号）：\n" + items.map((it, i) => `${i}. ${it}`).join("\n"));
+    if (n == null) return resolve(null);
+    const i = parseInt(n);
+    resolve(i >= 0 && i < items.length ? i : null);
+  });
+}
+
+async function deploy() {
+  const idx = Number($("#deployFrom").value);
+  if (!wallets[idx]) return toast("请先生成钱包", "err");
+  let ctor;
+  const raw = $("#constructor").value.trim();
+  if (raw) {
+    try { ctor = JSON.parse(raw); } catch (e) { return toast("构造参数不是合法 JSON", "err"); }
+    if (!Array.isArray(ctor)) return toast("构造参数必须是数组", "err");
+  }
+  const fee = parseFloat($("#deployFee").value || 0);
+  try {
+    const d = await API.post("/api/contract/deploy",
+      { sender: wallets[idx].address, code: code(), constructor: ctor, fee });
+    if (d.ok) {
+      toast("部署交易已提交，合约地址 " + fmt.addr(d.address, 8), "ok");
+      toast("提示：请到交易池页面出块以确认部署", "info");
+    } else toast(d.reason || d.error, "err");
+    await loadContracts();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function loadContracts() {
+  const d = await API.get("/api/contract/list");
+  $("#contractHint").textContent = `（${d.contracts.length} 个）`;
+  const box = $("#contractList");
+  if (!d.contracts.length) {
+    box.innerHTML = `<div class="empty"><div class="big">📦</div>尚未部署合约</div>`;
+    return;
+  }
+  box.innerHTML = `<div class="table-wrap"><table><thead><tr>
+    <th>合约地址</th><th>创建者</th><th>余额</th><th>状态键数</th><th>代码长度</th><th></th></tr></thead>
+    <tbody>${d.contracts.map(c => `
+      <tr>
+        <td class="hash" title="${esc(c.address)}">${fmt.addr(c.address, 8)}</td>
+        <td class="addr">${fmt.addr(c.creator, 6)}</td>
+        <td class="mono-num">${fmt.amount(c.balance)}</td>
+        <td class="mono-num">${c.storage_keys}</td>
+        <td class="mono-num">${c.code.length} B</td>
+        <td><a class="btn ghost sm" href="interact.html?addr=${c.address}">交互 →</a></td>
+      </tr>`).join("")}</tbody></table></div>`;
+}
+
+document.addEventListener("DOMContentLoaded", init);
+</script>
+</body>
+</html>
