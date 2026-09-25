@@ -6,14 +6,14 @@ new blocks/transactions to its peers, and synchronise its chain from whichever
 peer has the greatest cumulative work — resolving forks by re-organisation.
 """
 
+import json
 import threading
 import time
 
 from . import crypto, pow as pow_mod
 from .block import Block
 from .blockchain import Blockchain
-from .config import (COINBASE_REWARD, CONTRACT_EVENT_DEDUP_KEY,
-                     MAX_TX_PER_BLOCK, MINING_INTERVAL)
+from .config import (COINBASE_REWARD, MAX_TX_PER_BLOCK, MINING_INTERVAL)
 from .p2p import PeerRegistry, dial_peer, http_get_json, http_post_json
 from .state import ZERO_ADDRESS
 from .storage import DataPaths, atomic_write_json, read_json
@@ -274,9 +274,14 @@ class Node:
                     "event": e.get("event"), "data": e.get("data"),
                 })
             data["events"] = data["events"][-2000:]
+            # De-duplicate re-recorded receipts (e.g. a block seen twice)
+            # without collapsing distinct events that happen to share a name.
             dedup = {}
             for entry in data["events"]:
-                dedup[entry.get(CONTRACT_EVENT_DEDUP_KEY)] = entry
+                key = (entry.get("height"), entry.get("txid"),
+                       entry.get("event"),
+                       json.dumps(entry.get("data"), sort_keys=True))
+                dedup[key] = entry
             data["events"] = list(dedup.values())
             atomic_write_json(path, data)
 
@@ -289,6 +294,7 @@ class Node:
             data = {
                 "address": addr,
                 "creator": c.get("creator"),
+                "created_at": c.get("created_at"),
                 "code": c.get("code"),
                 "storage": c.get("storage"),
                 "balance": st.balance(addr),

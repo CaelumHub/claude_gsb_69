@@ -467,6 +467,118 @@ class Blockchain:
         return txs[:limit]
 
     # ==================================================================== #
+    # Historical queries (read-only)
+    # ==================================================================== #
+    # Every block persists a state snapshot (``state/NNNNNN.json``), so the
+    # world state at any past height can be reconstructed by loading that
+    # snapshot from disk.  These helpers only ever *read* snapshots into
+    # detached ``WorldState`` copies — the live ``self.state`` is never
+    # touched, so historical queries cannot interfere with normal reads
+    # and writes of the current state.
+    def state_at(self, height):
+        """Return the world state *after* ``height`` as a detached copy.
+
+        Returns ``None`` when the height is out of range or the snapshot
+        file is missing.
+        """
+        if height < 0 or height > self.height:
+            return None
+        data = read_json(self.paths.state_path(height))
+        return WorldState.from_dict(data) if data is not None else None
+
+    def contract_creation_height(self, address):
+        """Height at which ``address`` was deployed, or ``None`` if unknown."""
+        c = self.state.contract(address)
+        if c is not None and c.get("created_at") is not None:
+            return int(c["created_at"])
+        # Fall back to scanning the chain for the deploy transaction; this
+        # covers contracts deployed before ``created_at`` was tracked.
+        for blk in self.chain:
+            for tx in blk.transactions:
+                if (tx.tx_type == "deploy"
+                        and self._contract_address(tx) == address):
+                    return blk.index
+        return None
+
+    def contract_state_at(self, address, height):
+        """Storage and balance of ``address`` at ``height`` (read-only).
+
+        Returns a result dict.  On failure ``ok`` is False and ``error``
+        explains why — querying beyond the chain head or before the
+        contract's creation height both produce explicit messages.
+        """
+        created = self.contract_creation_height(address)
+        base = {"address": address, "height": height,
+                "current_height": self.height, "created_at": created}
+        if self.state.contract(address) is None and created is None:
+            return dict(base, ok=False, status=404,
+                        error="contract not found")
+        if height < 0:
+            return dict(base, ok=False, status=400,
+                        error="height must be non-negative")
+        if height > self.height:
+            return dict(base, ok=False, status=400,
+                        error=(f"height {height} is beyond the current "
+                               f"chain height {self.height}"))
+        if created is not None and height < created:
+            return dict(base, ok=False, status=400,
+                        error=(f"contract did not exist at height {height} "
+                               f"(created at height {created})"))
+        snap = self.state_at(height)
+        if snap is None:
+            return dict(base, ok=False, status=404,
+                        error=f"no state snapshot stored at height {height}")
+        c = snap.contract(address)
+        if c is None:
+            return dict(base, ok=False, status=400,
+                        error=f"contract did not exist at height {height}")
+        return dict(base, ok=True, creator=c.get("creator"),
+                    storage=c.get("storage", {}),
+                    balance=snap.balance(address))
+
+    @staticmethod
+    def storage_diff(before, after):
+        """Key-level diff between two contract storage dicts (JSON values)."""
+        before = before or {}
+        after = after or {}
+        added = {k: v for k, v in after.items() if k not in before}
+        removed = {k: v for k, v in before.items() if k not in after}
+        changed = {k: {"from": before[k], "to": after[k]}
+                   for k in before.keys() & after.keys()
+                   if before[k] != after[k]}
+        unchanged = sum(1 for k in before.keys() & after.keys()
+                        if before[k] == after[k])
+        return {"added": added, "removed": removed, "changed": changed,
+                "unchanged": unchanged}
+
+    def contract_diff(self, address, height_a, height_b):
+        """Compare a contract's state at two historical heights (read-only).
+
+        The lower height is used as the baseline regardless of argument
+        order; the result carries both snapshots plus a key-level diff and
+        the balance change.
+        """
+        lo, hi = ((height_a, height_b) if height_a <= height_b
+                  else (height_b, height_a))
+        first = self.contract_state_at(address, lo)
+        if not first["ok"]:
+            return first
+        second = self.contract_state_at(address, hi)
+        if not second["ok"]:
+            return second
+        return {
+            "ok": True, "address": address, "from": lo, "to": hi,
+            "current_height": self.height,
+            "created_at": first.get("created_at"),
+            "balance_from": first["balance"],
+            "balance_to": second["balance"],
+            "balance_delta": round(second["balance"] - first["balance"], 10),
+            "storage_from": first["storage"],
+            "storage_to": second["storage"],
+            "diff": self.storage_diff(first["storage"], second["storage"]),
+        }
+
+    # ==================================================================== #
     # Tamper detection / full validation
     # ==================================================================== #
     def validate_full_chain(self):

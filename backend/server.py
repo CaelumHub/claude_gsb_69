@@ -394,6 +394,7 @@ def create_app(node):
         for addr, c in st.contracts.items():
             out.append({
                 "address": addr, "creator": c.get("creator"),
+                "created_at": c.get("created_at"),
                 "code": c["code"],
                 "storage": c["storage"],
                 "balance": st.balance(addr),
@@ -403,16 +404,56 @@ def create_app(node):
 
     @app.get("/api/contract/<addr>")
     def contract_detail(addr):
-        st = node.blockchain.state
+        bc = node.blockchain
+        st = bc.state
         c = st.contract(addr)
         if not c:
             return _json({"ok": False, "error": "contract not found"}, 404)
         events = node.contract_events(addr)
         return _json({
             "ok": True, "address": addr, "creator": c.get("creator"),
+            "created_at": bc.contract_creation_height(addr),
+            "current_height": bc.height,
             "code": c["code"], "storage": c["storage"],
             "balance": st.balance(addr), "events": events[-200:],
         })
+
+    @app.get("/api/contract/<addr>/history")
+    def contract_history(addr):
+        """Read-only view of a contract at a past height: storage, balance,
+        and every event emitted up to that height."""
+        try:
+            height = int(request.args.get("height", ""))
+        except (TypeError, ValueError):
+            return _json({"ok": False, "error": "invalid height"}, 400)
+        result = node.blockchain.contract_state_at(addr, height)
+        status = result.pop("status", 200 if result.get("ok") else 400)
+        if not result.get("ok"):
+            return _json(result, status)
+        events = [e for e in node.contract_events(addr)
+                  if int(e.get("height", 0)) <= height]
+        result["events"] = events[-200:]
+        result["event_count"] = len(events)
+        return _json(result)
+
+    @app.get("/api/contract/<addr>/history/diff")
+    def contract_history_diff(addr):
+        """Compare a contract's storage and balance at two past heights."""
+        try:
+            height_a = int(request.args.get("from", ""))
+            height_b = int(request.args.get("to", ""))
+        except (TypeError, ValueError):
+            return _json({"ok": False, "error": "invalid from/to height"}, 400)
+        result = node.blockchain.contract_diff(addr, height_a, height_b)
+        status = result.pop("status", 200 if result.get("ok") else 400)
+        if not result.get("ok"):
+            return _json(result, status)
+        lo, hi = result["from"], result["to"]
+        events = [e for e in node.contract_events(addr)
+                  if lo < int(e.get("height", 0)) <= hi]
+        result["events"] = events[-200:]
+        result["event_count"] = len(events)
+        return _json(result)
 
     @app.post("/api/contract/<addr>/call")
     def contract_call(addr):

@@ -59,6 +59,26 @@
         </div>
       </div>
 
+      <div class="card" style="margin-top:16px;">
+        <h2>历史状态查询 <span class="hint" id="histRangeHint">只读查询，不影响当前状态</span></h2>
+        <div class="row">
+          <div class="field"><label>回看高度</label>
+            <input id="histHeight" type="number" min="0" step="1" placeholder="区块高度"></div>
+          <div class="field" style="justify-content:flex-end;">
+            <button class="btn" onclick="queryHistory()">🕰 查询该高度</button>
+          </div>
+          <div class="spacer"></div>
+          <div class="field"><label>对比高度 A</label>
+            <input id="diffFrom" type="number" min="0" step="1" placeholder="如 3"></div>
+          <div class="field"><label>对比高度 B</label>
+            <input id="diffTo" type="number" min="0" step="1" placeholder="如 7"></div>
+          <div class="field" style="justify-content:flex-end;">
+            <button class="btn" onclick="queryDiff()">⇄ 对比 A / B</button>
+          </div>
+        </div>
+        <div id="histResult" style="margin-top:12px;"></div>
+      </div>
+
       <div class="grid cols-2" style="margin-top:16px;">
         <div class="card">
           <h2>合约代码</h2>
@@ -120,12 +140,19 @@ async function selectContract(addr) {
   $("#contractInfo").innerHTML = `
     <dt>合约地址</dt><dd class="hash">${esc(c.address)}</dd>
     <dt>创建者</dt><dd class="addr">${esc(c.creator || "—")}</dd>
+    <dt>创建高度</dt><dd class="mono-num">${c.created_at != null ? "#" + c.created_at : "—"}</dd>
     <dt>余额</dt><dd class="mono-num">${fmt.amount(c.balance)} LC</dd>
     <dt>状态键数</dt><dd>${Object.keys(c.storage || {}).length}</dd>`;
   $("#storageView").textContent = JSON.stringify(c.storage || {}, null, 2);
   $("#codeView").textContent = c.code || "";
   renderFunctions(c.code);
   renderEvents(c.events || []);
+  // Guide the history picker: valid lookback range is [created, current].
+  const lo = c.created_at != null ? c.created_at : 0;
+  $("#histRangeHint").textContent =
+    `可查询范围 #${lo} ~ #${c.current_height}（只读，不影响当前状态）`;
+  $("#histHeight").placeholder = `#${lo} ~ #${c.current_height}`;
+  $("#histResult").innerHTML = "";
 }
 
 function renderFunctions(code) {
@@ -144,18 +171,124 @@ function renderFunctions(code) {
   }
 }
 
-function renderEvents(events) {
-  $("#eventHint").textContent = `（${events.length} 条）`;
-  const box = $("#eventList");
-  if (!events.length) { box.innerHTML = `<div class="empty">暂无事件</div>`; return; }
-  box.innerHTML = events.slice().reverse().map(e => `
+function eventCardHtml(e) {
+  return `
     <div style="padding:8px 10px;border:1px solid var(--border);border-radius:8px;margin-bottom:8px;">
       <div class="flex"><span class="badge purple">${esc(e.event)}</span>
         <span class="muted small">高度 #${e.height}</span>
         <span class="spacer"></span>
         <span class="muted small">${fmt.hash(e.txid, 6)}</span></div>
       <pre class="code" style="margin-top:6px;font-size:11.5px;padding:8px;">${esc(JSON.stringify(e.data, null, 2))}</pre>
-    </div>`).join("");
+    </div>`;
+}
+
+function renderEvents(events) {
+  $("#eventHint").textContent = `（${events.length} 条）`;
+  const box = $("#eventList");
+  if (!events.length) { box.innerHTML = `<div class="empty">暂无事件</div>`; return; }
+  box.innerHTML = events.slice().reverse().map(eventCardHtml).join("");
+}
+
+/* ---------- 历史状态查询 / 对比 ---------- */
+function histError(msg) {
+  $("#histResult").innerHTML = `<span class="badge red">✗ ${esc(msg)}</span>`;
+}
+
+// Client-side range check for instant feedback; the server re-validates.
+function checkHeight(h) {
+  if (currentDetail) {
+    if (h > currentDetail.current_height)
+      return `高度 #${h} 超出当前链高 #${currentDetail.current_height}`;
+    if (currentDetail.created_at != null && h < currentDetail.created_at)
+      return `高度 #${h} 早于合约创建高度 #${currentDetail.created_at}`;
+  }
+  return null;
+}
+
+async function queryHistory() {
+  if (!current) return toast("请先选择合约", "err");
+  const h = parseInt($("#histHeight").value, 10);
+  if (isNaN(h) || h < 0) return histError("请输入有效的区块高度");
+  const bad = checkHeight(h);
+  if (bad) return histError(bad);
+  try {
+    const d = await API.get(`/api/contract/${current}/history?height=${h}`);
+    renderHistory(d);
+  } catch (e) { histError(e.message); }
+}
+
+async function queryDiff() {
+  if (!current) return toast("请先选择合约", "err");
+  const a = parseInt($("#diffFrom").value, 10);
+  const b = parseInt($("#diffTo").value, 10);
+  if (isNaN(a) || isNaN(b) || a < 0 || b < 0)
+    return histError("请输入两个有效的对比高度");
+  const bad = checkHeight(a) || checkHeight(b);
+  if (bad) return histError(bad);
+  try {
+    const d = await API.get(`/api/contract/${current}/history/diff?from=${a}&to=${b}`);
+    renderDiff(d);
+  } catch (e) { histError(e.message); }
+}
+
+function renderHistory(d) {
+  const evts = (d.events || []).slice().reverse().map(eventCardHtml).join("");
+  $("#histResult").innerHTML = `
+    <div class="flex">
+      <span class="badge blue">高度 #${d.height}</span>
+      <span class="badge gray">余额 ${fmt.amount(d.balance)} LC</span>
+      <span class="badge gray">状态键 ${Object.keys(d.storage || {}).length} 个</span>
+      <span class="badge gray">截至该高度事件 ${d.event_count} 条</span>
+    </div>
+    <div class="grid cols-2" style="margin-top:10px;">
+      <div>
+        <div class="section-title">高度 #${d.height} 的存储</div>
+        <pre class="code" style="max-height:220px;">${esc(JSON.stringify(d.storage || {}, null, 2))}</pre>
+      </div>
+      <div>
+        <div class="section-title">截至高度 #${d.height} 的事件</div>
+        <div style="max-height:220px;overflow:auto;">${evts || '<div class="empty">该高度之前无事件</div>'}</div>
+      </div>
+    </div>`;
+}
+
+function renderDiff(d) {
+  const diff = d.diff || { added: {}, removed: {}, changed: {} };
+  const rows = [];
+  for (const [k, v] of Object.entries(diff.changed))
+    rows.push(`<tr><td class="mono">${esc(k)}</td>
+      <td><span class="badge amber">修改</span></td>
+      <td class="mono">${esc(JSON.stringify(v.from))}</td>
+      <td class="mono">${esc(JSON.stringify(v.to))}</td></tr>`);
+  for (const [k, v] of Object.entries(diff.added))
+    rows.push(`<tr><td class="mono">${esc(k)}</td>
+      <td><span class="badge green">新增</span></td>
+      <td class="mono muted">—</td>
+      <td class="mono">${esc(JSON.stringify(v))}</td></tr>`);
+  for (const [k, v] of Object.entries(diff.removed))
+    rows.push(`<tr><td class="mono">${esc(k)}</td>
+      <td><span class="badge red">删除</span></td>
+      <td class="mono">${esc(JSON.stringify(v))}</td>
+      <td class="mono muted">—</td></tr>`);
+  const delta = d.balance_delta;
+  const deltaCls = delta > 0 ? "green" : (delta < 0 ? "red" : "gray");
+  const deltaTxt = (delta > 0 ? "+" : "") + fmt.amount(delta);
+  const evts = (d.events || []).slice().reverse().map(eventCardHtml).join("");
+  $("#histResult").innerHTML = `
+    <div class="flex">
+      <span class="badge blue">#${d.from} → #${d.to}</span>
+      <span class="badge gray">余额 ${fmt.amount(d.balance_from)} → ${fmt.amount(d.balance_to)} LC</span>
+      <span class="badge ${deltaCls}">Δ ${deltaTxt} LC</span>
+      <span class="badge gray">变更 ${rows.length} 键 · 未变 ${diff.unchanged || 0} 键</span>
+    </div>
+    <div class="table-wrap" style="margin-top:10px;">
+      <table>
+        <thead><tr><th>状态键</th><th>变化</th><th>高度 #${d.from}</th><th>高度 #${d.to}</th></tr></thead>
+        <tbody>${rows.join("") || '<tr><td colspan="4" class="empty">两个高度之间存储无变化</td></tr>'}</tbody>
+      </table>
+    </div>
+    <div class="section-title" style="margin-top:10px;">高度 (#${d.from}, #${d.to}] 之间产生的事件（${d.event_count} 条）</div>
+    <div style="max-height:220px;overflow:auto;">${evts || '<div class="empty">该区间无事件</div>'}</div>`;
 }
 
 function parseArgs() {

@@ -165,7 +165,7 @@ class ContractEngine:
             result["error"] = msg
             return result
 
-        world_state.create_contract(address, code, creator)
+        world_state.create_contract(address, code, creator, created_at=height)
         context, events, transfers = self.build_context(
             world_state, address, creator, 0, height)
         ctx = {k: v for k, v in context.items()}

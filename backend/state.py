@@ -72,11 +72,16 @@ class WorldState:
     def contract(self, address):
         return self.contracts.get(address)
 
-    def create_contract(self, address, code, creator, storage=None):
+    def create_contract(self, address, code, creator, storage=None,
+                        created_at=None):
         self.contracts[address] = {
             "code": code,
             "storage": storage or {},
             "creator": creator,
+            # Non-consensus metadata: the height at which the contract was
+            # deployed.  Excluded from the state root (see ``_for_hash``) so
+            # historical snapshots remain comparable across versions.
+            "created_at": created_at,
         }
         return self.contracts[address]
 
@@ -88,8 +93,9 @@ class WorldState:
     # Hashing / snapshotting
     # ------------------------------------------------------------------ #
     def _for_hash(self):
-        # Events and non-consensus metadata are deliberately excluded.  A
-        # contract's *balance* lives in ``accounts`` (single source of truth).
+        # Events and non-consensus metadata (such as ``created_at``) are
+        # deliberately excluded.  A contract's *balance* lives in
+        # ``accounts`` (single source of truth).
         contracts = {
             addr: {
                 "code": c["code"],
@@ -117,6 +123,7 @@ class WorldState:
                     "code": c["code"],
                     "storage": c["storage"],
                     "creator": c.get("creator"),
+                    "created_at": c.get("created_at"),
                 }
                 for addr, c in self.contracts.items()
             },
