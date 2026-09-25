@@ -14,7 +14,7 @@
     <main class="content">
       <div class="page-head">
         <h1>合约交互</h1>
-        <p>加载已部署合约，调用只读/写入函数，查看状态、余额与事件日志。</p>
+        <p>加载已部署合约，调用只读/写入函数，查看状态、余额与事件日志；支持按历史高度回看状态与事件、对比两个高度的差异。</p>
       </div>
 
       <div class="card">
@@ -59,6 +59,52 @@
         </div>
       </div>
 
+      <!-- ================= 历史状态查询 ================= -->
+      <div class="card" style="margin-top:16px;">
+        <div class="flex">
+          <h2 style="margin:0;">🕰 历史状态回看
+            <span class="hint">只读查询，读取该高度已落盘的状态快照，绝不影响当前状态的读写</span>
+          </h2>
+          <div class="spacer"></div>
+          <span class="badge gray" id="histRange"></span>
+        </div>
+        <div class="row" style="margin-top:12px;">
+          <div class="field">
+            <label>区块高度</label>
+            <input id="histHeight" type="number" min="0" step="1" style="width:140px;"
+                   placeholder="例如 12">
+          </div>
+          <button class="btn primary" onclick="queryHistory()">查询历史状态</button>
+          <button class="btn ghost sm" onclick="useCreatedHeight()" title="跳到合约创建高度">⤵ 创建高度</button>
+          <button class="btn ghost sm" onclick="useCurrentHeight()" title="跳到当前链高度">⤴ 当前高度</button>
+          <span id="histMsg"></span>
+        </div>
+        <div id="histResult" style="margin-top:8px;"></div>
+      </div>
+
+      <!-- ================= 两高度对比 ================= -->
+      <div class="card" style="margin-top:16px;">
+        <div class="flex">
+          <h2 style="margin:0;">🔀 两个历史高度对比
+            <span class="hint">可任意顺序填写，自动按高度排序；对比存储、余额与期间事件</span>
+          </h2>
+        </div>
+        <div class="row" style="margin-top:12px;">
+          <div class="field">
+            <label>高度 A</label>
+            <input id="diffA" type="number" min="0" step="1" style="width:120px;" placeholder="较小">
+          </div>
+          <div class="field">
+            <label>高度 B</label>
+            <input id="diffB" type="number" min="0" step="1" style="width:120px;" placeholder="较大">
+          </div>
+          <button class="btn primary" onclick="queryDiff()">对比差异</button>
+          <button class="btn ghost sm" onclick="quickDiffAdjacent()">最近两块</button>
+          <span id="diffMsg"></span>
+        </div>
+        <div id="diffResult" style="margin-top:8px;"></div>
+      </div>
+
       <div class="grid cols-2" style="margin-top:16px;">
         <div class="card">
           <h2>合约代码</h2>
@@ -81,6 +127,8 @@ let contracts = [];
 let wallets = [];
 let current = null;
 let currentDetail = null;
+let chainHeight = 0;
+let createdHeight = null;
 
 async function init() {
   await loadWallets();
@@ -98,6 +146,7 @@ async function loadWallets() {
 async function refreshContracts() {
   const d = await API.get("/api/contract/list");
   contracts = d.contracts;
+  chainHeight = d.height || 0;
   const sel = $("#contractSelect");
   sel.innerHTML = contracts.map(c =>
     `<option value="${c.address}">${fmt.addr(c.address, 10)}</option>`).join("");
@@ -116,16 +165,215 @@ async function selectContract(addr) {
   current = addr;
   currentDetail = await API.get("/api/contract/" + addr);
   const c = currentDetail;
+  chainHeight = c.height || chainHeight;
+  createdHeight = (c.created_at === null || c.created_at === undefined) ? null : c.created_at;
   $("#contractBalance").textContent = "余额 " + fmt.amount(c.balance) + " LC";
   $("#contractInfo").innerHTML = `
     <dt>合约地址</dt><dd class="hash">${esc(c.address)}</dd>
     <dt>创建者</dt><dd class="addr">${esc(c.creator || "—")}</dd>
-    <dt>余额</dt><dd class="mono-num">${fmt.amount(c.balance)} LC</dd>
+    <dt>创建高度</dt><dd class="mono-num">${createdHeight === null ? "—" : "#" + createdHeight}</dd>
+    <dt>当前链高度</dt><dd class="mono-num">#${chainHeight}</dd>
+    <dt>当前余额</dt><dd class="mono-num">${fmt.amount(c.balance)} LC</dd>
     <dt>状态键数</dt><dd>${Object.keys(c.storage || {}).length}</dd>`;
   $("#storageView").textContent = JSON.stringify(c.storage || {}, null, 2);
   $("#codeView").textContent = c.code || "";
   renderFunctions(c.code);
   renderEvents(c.events || []);
+  resetHistoryUi();
+}
+
+function resetHistoryUi() {
+  $("#histRange").textContent = createdHeight === null
+    ? "" : `可选范围 #${createdHeight}（创建） ~ #${chainHeight}（当前）`;
+  $("#histHeight").value = "";
+  $("#diffA").value = "";
+  $("#diffB").value = "";
+  $("#histResult").innerHTML = "";
+  $("#diffResult").innerHTML = "";
+  $("#histMsg").innerHTML = "";
+  $("#diffMsg").innerHTML = "";
+}
+
+function useCreatedHeight() {
+  if (createdHeight !== null) { $("#histHeight").value = createdHeight; queryHistory(); }
+}
+function useCurrentHeight() {
+  $("#histHeight").value = chainHeight; queryHistory();
+}
+function quickDiffAdjacent() {
+  const lo = Math.max(createdHeight || 0, chainHeight - 1);
+  $("#diffA").value = lo;
+  $("#diffB").value = chainHeight;
+  queryDiff();
+}
+
+/* ---------------- 历史查询 ---------------- */
+function setInlineMsg(el, text, kind) {
+  if (!text) { el.innerHTML = ""; return; }
+  const cls = kind === "err" ? "red" : kind === "warn" ? "amber" : "green";
+  el.innerHTML = `<span class="badge ${cls}" style="vertical-align:middle;">${esc(text)}</span>`;
+}
+
+async function queryHistory() {
+  const box = $("#histResult");
+  const msg = $("#histMsg");
+  box.innerHTML = "";
+  const raw = $("#histHeight").value.trim();
+  if (raw === "") return setInlineMsg(msg, "请输入区块高度", "err");
+  const h = Number(raw);
+  if (!Number.isInteger(h)) return setInlineMsg(msg, "高度必须是整数", "err");
+  // 友好的前置提示，避免无意义请求
+  if (h < 0) return setInlineMsg(msg, "区块高度不能为负数", "err");
+  if (h > chainHeight) return setInlineMsg(msg, `高度 #${h} 高于当前高度 #${chainHeight}，无法查询未来状态`, "err");
+  if (createdHeight !== null && h < createdHeight)
+    return setInlineMsg(msg, `合约在 #${createdHeight} 才创建，#${h} 时还不存在`, "warn");
+  setInlineMsg(msg, "查询中…", null);
+  try {
+    const d = await API.get(`/api/contract/${current}/history?height=${h}`);
+    setInlineMsg(msg, "", null);
+    if (d.warning) setInlineMsg(msg, d.warning, "warn");
+    renderHistory(d);
+  } catch (e) {
+    box.innerHTML = "";
+    setInlineMsg(msg, e.message, "err");
+  }
+}
+
+function renderHistory(d) {
+  const box = $("#histResult");
+  if (d.existed === false) {
+    box.innerHTML = `<div class="empty" style="padding:24px;">
+      <div class="big">🌱</div>
+      高度 #${d.height} 早于合约创建高度 <b>#${d.created_at}</b>，合约当时尚未部署。
+      </div>`;
+    return;
+  }
+  const events = d.events || [];
+  box.innerHTML = `
+    <div class="grid cols-3">
+      <div class="subcard">
+        <div class="subcap">查询高度</div>
+        <div class="subval mono-num">#${d.height}</div>
+        <div class="subfoot">当前 #${d.current_height} · 创建 #${d.created_at}</div>
+      </div>
+      <div class="subcard">
+        <div class="subcap">当时余额</div>
+        <div class="subval mono-num">${fmt.amount(d.balance)} LC</div>
+        <div class="subfoot">区块 ${fmt.hash(d.block_hash, 8)}</div>
+      </div>
+      <div class="subcard">
+        <div class="subcap">截至该高度事件</div>
+        <div class="subval mono-num">${events.length} 条</div>
+        <div class="subfoot">状态键 ${Object.keys(d.storage || {}).length} 个</div>
+      </div>
+    </div>
+    <div class="grid cols-2" style="margin-top:12px;">
+      <div>
+        <div class="section-title">存储值 (height #${d.height})</div>
+        <pre class="code" style="max-height:280px;">${esc(JSON.stringify(d.storage || {}, null, 2))}</pre>
+      </div>
+      <div>
+        <div class="section-title">事件（0 ~ #${d.height}，共 ${events.length} 条）</div>
+        <div style="max-height:280px; overflow:auto;">${renderEventCards(events.slice().reverse())}</div>
+      </div>
+    </div>`;
+}
+
+function renderEventCards(events) {
+  if (!events.length) return `<div class="empty" style="padding:24px;">暂无事件</div>`;
+  return events.map(e => `
+    <div style="padding:8px 10px;border:1px solid var(--border);border-radius:8px;margin-bottom:8px;">
+      <div class="flex"><span class="badge purple">${esc(e.event)}</span>
+        <span class="muted small">高度 #${e.height}</span>
+        <span class="spacer"></span>
+        <span class="muted small">${fmt.hash(e.txid, 6)}</span></div>
+      <pre class="code" style="margin-top:6px;font-size:11.5px;padding:8px;">${esc(JSON.stringify(e.data, null, 2))}</pre>
+    </div>`).join("");
+}
+
+/* ---------------- 两高度对比 ---------------- */
+async function queryDiff() {
+  const box = $("#diffResult");
+  const msg = $("#diffMsg");
+  box.innerHTML = "";
+  const ra = $("#diffA").value.trim();
+  const rb = $("#diffB").value.trim();
+  if (ra === "" || rb === "")
+    return setInlineMsg(msg, "请填写两个高度", "err");
+  const a = Number(ra);
+  const b = Number(rb);
+  if (!Number.isInteger(a) || !Number.isInteger(b))
+    return setInlineMsg(msg, "请填写两个整数高度", "err");
+  if (a < 0 || b < 0) return setInlineMsg(msg, "区块高度不能为负数", "err");
+  const hi = Math.max(a, b);
+  if (hi > chainHeight)
+    return setInlineMsg(msg, `高度 #${hi} 高于当前高度 #${chainHeight}，无法查询未来状态`, "err");
+  const lo = Math.min(a, b);
+  if (createdHeight !== null && lo < createdHeight)
+    return setInlineMsg(msg, `合约在 #${createdHeight} 才创建，#${lo} 时还不存在`, "err");
+  setInlineMsg(msg, "对比中…", null);
+  try {
+    const d = await API.get(`/api/contract/${current}/diff?a=${a}&b=${b}`);
+    setInlineMsg(msg, "", null);
+    renderDiff(d);
+  } catch (e) {
+    box.innerHTML = "";
+    setInlineMsg(msg, e.message, "err");
+  }
+}
+
+function renderDiff(d) {
+  const sd = d.storage_diff || {};
+  const nAdd = Object.keys(sd.added || {}).length;
+  const nRem = Object.keys(sd.removed || {}).length;
+  const nChg = Object.keys(sd.changed || {}).length;
+  const nSame = (sd.unchanged_keys || []).length;
+  const evs = d.events_between || [];
+  const delta = d.balance_delta;
+  const deltaCls = delta > 0 ? "green" : delta < 0 ? "red" : "gray";
+  const deltaTxt = delta > 0 ? "+" + fmt.amount(delta) : fmt.amount(delta);
+  $("#diffResult").innerHTML = `
+    <div class="grid cols-4">
+      <div class="subcard"><div class="subcap">起点 A</div>
+        <div class="subval mono-num">#${d.a.height}</div>
+        <div class="subfoot">余额 ${fmt.amount(d.a.balance)}</div></div>
+      <div class="subcard"><div class="subcap">终点 B</div>
+        <div class="subval mono-num">#${d.b.height}</div>
+        <div class="subfoot">余额 ${fmt.amount(d.balance)}</div></div>
+      <div class="subcard"><div class="subcap">余额变化 (B−A)</div>
+        <div class="subval mono-num"><span class="badge ${deltaCls}">${deltaTxt} LC</span></div>
+        <div class="subfoot">${nSame} 个键未变</div></div>
+      <div class="subcard"><div class="subcap">存储变化</div>
+        <div class="subval mono-num">
+          <span class="badge green" title="新增">+${nAdd}</span>
+          <span class="badge red" title="删除">−${nRem}</span>
+          <span class="badge amber" title="修改">~${nChg}</span>
+        </div>
+        <div class="subfoot">期间事件 ${evs.length} 条</div></div>
+    </div>
+
+    <div class="grid cols-2" style="margin-top:12px;">
+      <div>
+        <div class="section-title">存储差异明细</div>
+        <pre class="code" style="max-height:300px;">${esc(JSON.stringify({
+          新增: sd.added || {}, 删除: sd.removed || {}, 修改: sd.changed || {},
+        }, null, 2))}</pre>
+      </div>
+      <div>
+        <div class="section-title">期间事件（#${d.a.height + 1} ~ #${d.b.height}，共 ${evs.length} 条）</div>
+        <div style="max-height:300px; overflow:auto;">${renderEventCards(evs.slice().reverse())}</div>
+      </div>
+    </div>
+
+    <details style="margin-top:10px;">
+      <summary class="hint" style="cursor:pointer;">查看两个高度的完整状态</summary>
+      <div class="grid cols-2" style="margin-top:8px;">
+        <div><div class="section-title">A @ #${d.a.height}</div>
+          <pre class="code" style="max-height:240px;">${esc(JSON.stringify(d.a.storage || {}, null, 2))}</pre></div>
+        <div><div class="section-title">B @ #${d.b.height}</div>
+          <pre class="code" style="max-height:240px;">${esc(JSON.stringify(d.b.storage || {}, null, 2))}</pre></div>
+      </div>
+    </details>`;
 }
 
 function renderFunctions(code) {
@@ -148,14 +396,7 @@ function renderEvents(events) {
   $("#eventHint").textContent = `（${events.length} 条）`;
   const box = $("#eventList");
   if (!events.length) { box.innerHTML = `<div class="empty">暂无事件</div>`; return; }
-  box.innerHTML = events.slice().reverse().map(e => `
-    <div style="padding:8px 10px;border:1px solid var(--border);border-radius:8px;margin-bottom:8px;">
-      <div class="flex"><span class="badge purple">${esc(e.event)}</span>
-        <span class="muted small">高度 #${e.height}</span>
-        <span class="spacer"></span>
-        <span class="muted small">${fmt.hash(e.txid, 6)}</span></div>
-      <pre class="code" style="margin-top:6px;font-size:11.5px;padding:8px;">${esc(JSON.stringify(e.data, null, 2))}</pre>
-    </div>`).join("");
+  box.innerHTML = renderEventCards(events.slice().reverse());
 }
 
 function parseArgs() {

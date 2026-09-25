@@ -128,6 +128,7 @@ class DataPaths:
         self.blocks_dir = os.path.join(root, _cfg.BLOCKS_SUBDIR)
         self.state_dir = os.path.join(root, _cfg.STATE_SUBDIR)
         self.contracts_dir = os.path.join(root, _cfg.CONTRACTS_SUBDIR)
+        self.receipts_dir = os.path.join(root, _cfg.RECEIPTS_SUBDIR)
         self.meta_path = os.path.join(root, _cfg.META_FILE)
         self.txpool_path = os.path.join(root, _cfg.TXPOOL_FILE)
         self.wallets_path = os.path.join(root, _cfg.WALLETS_FILE)
@@ -143,6 +144,10 @@ class DataPaths:
     def contract_path(self, address):
         return os.path.join(self.contracts_dir, address + ".json")
 
+    def receipt_path(self, height):
+        return os.path.join(self.receipts_dir, "%06d.json" % height)
+
     def ensure(self):
-        for d in (self.blocks_dir, self.state_dir, self.contracts_dir):
+        for d in (self.blocks_dir, self.state_dir, self.contracts_dir,
+                  self.receipts_dir):
             ensure_dir(d)

@@ -389,7 +389,8 @@ def create_app(node):
 
     @app.get("/api/contract/list")
     def contract_list():
-        st = node.blockchain.state
+        bc = node.blockchain
+        st = bc.state
         out = []
         for addr, c in st.contracts.items():
             out.append({
@@ -398,8 +399,9 @@ def create_app(node):
                 "storage": c["storage"],
                 "balance": st.balance(addr),
                 "storage_keys": len(c["storage"]),
+                "created_at": bc.contract_creation_height(addr),
             })
-        return _json({"contracts": out})
+        return _json({"contracts": out, "height": bc.height})
 
     @app.get("/api/contract/<addr>")
     def contract_detail(addr):
@@ -412,7 +414,70 @@ def create_app(node):
             "ok": True, "address": addr, "creator": c.get("creator"),
             "code": c["code"], "storage": c["storage"],
             "balance": st.balance(addr), "events": events[-200:],
+            "created_at": node.blockchain.contract_creation_height(addr),
+            "height": node.blockchain.height,
         })
+
+    # Error sentinels from Blockchain.contract_history / contract_diff mapped
+    # to (HTTP status, user-facing Chinese message).
+    _HISTORY_ERRORS = {
+        "future": (400, "目标高度高于当前链高度，无法查询未来状态"),
+        "negative": (400, "区块高度不能为负数"),
+        "missing": (404, "合约不存在（从未在链上部署）"),
+        "before_creation": (400, "该高度早于合约创建高度，合约当时尚未部署"),
+    }
+
+    def _parse_height_arg(raw):
+        if raw is None or raw == "":
+            return None, "缺少高度参数"
+        try:
+            return int(raw), None
+        except (TypeError, ValueError):
+            return None, "高度必须是整数"
+
+    @app.get("/api/contract/<addr>/history")
+    def contract_history(addr):
+        """Read-only historical state + events of a contract at one height."""
+        bc = node.blockchain
+        height, err = _parse_height_arg(request.args.get("height"))
+        if err:
+            return _json({"ok": False, "error": err}, 400)
+        with node.chain_lock:
+            try:
+                payload, code = bc.contract_history(addr, height)
+            except Exception as e:  # noqa: BLE001 - replay/tamper failures
+                return _json({"ok": False,
+                              "error": f"历史状态重放失败：{e}"}, 500)
+        if code:
+            status, message = _HISTORY_ERRORS[code]
+            # "before_creation" is a valid historical answer, not a failure.
+            if code == "before_creation":
+                payload["ok"] = True
+                payload["warning"] = message
+                return _json(payload)
+            return _json({"ok": False, "error": message, "code": code}, status)
+        payload["ok"] = True
+        return _json(payload)
+
+    @app.get("/api/contract/<addr>/diff")
+    def contract_diff(addr):
+        """Read-only comparison of contract state at two historical heights."""
+        bc = node.blockchain
+        a, err_a = _parse_height_arg(request.args.get("a"))
+        b, err_b = _parse_height_arg(request.args.get("b"))
+        if err_a or err_b:
+            return _json({"ok": False, "error": err_a or err_b}, 400)
+        with node.chain_lock:
+            try:
+                payload, code = bc.contract_diff(addr, a, b)
+            except Exception as e:  # noqa: BLE001 - replay/tamper failures
+                return _json({"ok": False,
+                              "error": f"历史状态重放失败：{e}"}, 500)
+        if code:
+            status, message = _HISTORY_ERRORS[code]
+            return _json({"ok": False, "error": message, "code": code}, status)
+        payload["ok"] = True
+        return _json(payload)
 
     @app.post("/api/contract/<addr>/call")
     def contract_call(addr):
@@ -570,7 +635,7 @@ def create_app(node):
     @app.post("/api/admin/reset")
     def admin_reset():
         import shutil
-        for sub in ("blocks", "state", "contracts"):
+        for sub in ("blocks", "state", "contracts", "receipts"):
             shutil.rmtree(os.path.join(node.paths.root, sub), ignore_errors=True)
             os.makedirs(os.path.join(node.paths.root, sub), exist_ok=True)
         node.blockchain = _fresh_blockchain(node)

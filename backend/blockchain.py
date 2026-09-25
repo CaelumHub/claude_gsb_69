@@ -42,6 +42,10 @@ class Blockchain:
         self.last_abandoned = []
         self.last_receipts = []
         self._loaded = False
+        # Caches used purely by read-only history queries; never consulted by
+        # consensus.  Invalidated whenever the main chain changes.
+        self._creation_height_cache = {}
+        self._receipts_cache = {}
 
     # ==================================================================== #
     # Basic accessors
@@ -134,14 +138,38 @@ class Blockchain:
         atomic_write_json(self.paths.block_path(block.index), block.to_dict())
         atomic_write_json(self.paths.state_path(block.index), state.to_dict())
 
+    def _persist_receipts(self, height, receipts):
+        """Persist execution receipts for a height (basis of history/event API).
+
+        Only consensus-relevant fields are stored.  Receipts let historical
+        event logs be answered from committed data instead of the per-contract
+        convenience files, which are not rebuilt on reorgs.
+        """
+        data = [
+            {
+                "txid": r.get("txid"),
+                "ok": bool(r.get("ok")),
+                "type": r.get("type"),
+                "contract": r.get("contract"),
+                "events": r.get("events") or [],
+                "return": r.get("return"),
+                "error": r.get("error"),
+                "coinbase": r.get("coinbase", False),
+            }
+            for r in receipts
+        ]
+        atomic_write_json(self.paths.receipt_path(height), data)
+        self._receipts_cache.pop(height, None)
+
     def _delete_block_files_above(self, height):
-        for f in os.listdir(self.paths.blocks_dir):
-            try:
-                h = int(f.split(".")[0])
-            except ValueError:
-                continue
-            if h > height:
-                os.remove(os.path.join(self.paths.blocks_dir, f))
+        for sub in (self.paths.blocks_dir, self.paths.receipts_dir):
+            for f in os.listdir(sub):
+                try:
+                    h = int(f.split(".")[0])
+                except ValueError:
+                    continue
+                if h > height:
+                    os.remove(os.path.join(sub, f))
         for f in os.listdir(self.paths.state_dir):
             try:
                 h = int(f.split(".")[0])
@@ -303,6 +331,7 @@ class Blockchain:
         self.chainwork += int(2 ** block.difficulty)
         self.last_receipts = receipts
         self._persist_block(block, new_state)
+        self._persist_receipts(block.index, receipts)
         self._write_meta()
         self.versions.record(block.index, block.hash)
         return "extended", "chain extended"
@@ -362,6 +391,8 @@ class Blockchain:
         self.chain = self.chain[:ancestor_height + 1]
         self.chainwork = self.cumulative_work_of(self.chain)
         self.last_abandoned = list(abandoned)  # for tx re-admission by the node
+        self._creation_height_cache.clear()
+        self._receipts_cache.clear()
 
         applied = 0
         all_receipts = []
@@ -375,6 +406,7 @@ class Blockchain:
             self.chain.append(blk)
             self.chainwork += int(2 ** blk.difficulty)
             self._persist_block(blk, state)
+            self._persist_receipts(blk.index, receipts)
             applied += 1
 
         self.state = state
@@ -398,10 +430,231 @@ class Blockchain:
         self.state = WorldState.from_dict(state_data)
         self.chain = self.chain[:target_height + 1]
         self.chainwork = self.cumulative_work_of(self.chain)
+        self._creation_height_cache.clear()
+        self._receipts_cache.clear()
         self._delete_block_files_above(target_height)
         self._write_meta()
         self.versions.record(target_height, self.head.hash)
         return True, f"rolled back to height {target_height}"
+
+    # ==================================================================== #
+    # Historical queries (read-only; never touch the live state)
+    # ==================================================================== #
+    def state_at(self, height):
+        """Return a *fresh copy* of the committed world state at ``height``.
+
+        Loaded from the per-height snapshot on disk, so historical reads never
+        alias or mutate :attr:`state` (the live state used for reads/writes).
+        """
+        if not (0 <= height <= self.height):
+            return None
+        data = read_json(self.paths.state_path(height))
+        return WorldState.from_dict(data) if data else None
+
+    def receipts_at(self, height):
+        """Committed tx receipts at ``height``; deterministically replay if missing.
+
+        Nodes started before receipts were persisted may lack the file.  The
+        block is then re-executed against the parent state snapshot on a
+        throwaway copy of state, and the derived receipts are cached to disk.
+        Resulting state must match the committed state root.
+        """
+        if not (0 <= height <= self.height):
+            return None
+        cached = self._receipts_cache.get(height)
+        if cached is not None:
+            return cached
+        data = read_json(self.paths.receipt_path(height))
+        if data is None:
+            block = self.get_block(height)
+            if height == 0:
+                data = []
+            else:
+                parent = self.state_at(height - 1)
+                _state, data = self.apply_block(block, parent)
+                if _state.root() != block.header.state_root:
+                    raise ChainValidationError(
+                        f"state root mismatch while replaying height {height}")
+            try:
+                atomic_write_json(self.paths.receipt_path(height), data)
+            except OSError:
+                pass  # read-only replica; caching is best-effort
+        self._receipts_cache[height] = data
+        return data
+
+    def contract_creation_height(self, address):
+        """Height at which ``address`` was successfully deployed, or ``None``.
+
+        A matching deploy transaction is confirmed by the committed state
+        snapshot of its block containing the contract (a reverted deploy is
+        absent).  Stale deploys from abandoned fork blocks are never
+        considered because only the main chain is scanned.
+        """
+        if address in self._creation_height_cache:
+            return self._creation_height_cache[address]
+        found = None
+        for blk in self.chain:
+            if not any(tx.tx_type == "deploy"
+                       and self._contract_address(tx) == address
+                       for tx in blk.transactions):
+                continue
+            snapshot = self.state_at(blk.index)
+            if snapshot is not None and snapshot.contract(address) is not None:
+                found = blk.index
+                break
+        self._creation_height_cache[address] = found
+        return found
+
+    def contract_events_until(self, address, height):
+        """All successful events emitted by ``address`` in blocks 0..height.
+
+        Events are taken from main-chain receipts, ordered oldest-first.
+        """
+        if not (0 <= height <= self.height):
+            return None
+        events = []
+        for h in range(0, height + 1):
+            for r in self.receipts_at(h) or []:
+                if r.get("contract") != address or not r.get("ok"):
+                    continue
+                for e in r.get("events") or []:
+                    events.append({
+                        "height": h,
+                        "txid": r.get("txid"),
+                        "event": e.get("event"),
+                        "data": e.get("data"),
+                    })
+        return events
+
+    @staticmethod
+    def _storage_diff(a_storage, b_storage):
+        """Per-key differences of storage at two heights (b relative to a)."""
+        added, removed, changed = [], [], []
+        for k in b_storage:
+            if k not in a_storage:
+                added.append(k)
+            elif a_storage[k] != b_storage[k]:
+                changed.append(k)
+        for k in a_storage:
+            if k not in b_storage:
+                removed.append(k)
+        return {
+            "added": {k: b_storage[k] for k in sorted(added)},
+            "removed": {k: a_storage[k] for k in sorted(removed)},
+            "changed": {k: {"from": a_storage[k], "to": b_storage[k]}
+                        for k in sorted(changed)},
+            "unchanged_keys": sorted(
+                k for k in a_storage if k in b_storage
+                and a_storage[k] == b_storage[k]),
+        }
+
+    def contract_history(self, address, height):
+        """Read-only historical snapshot of a contract at ``height``.
+
+        Returns ``(payload, error)`` where ``error`` is one of the sentinel
+        strings ``future`` / ``negative`` / ``missing`` / ``before_creation``.
+        """
+        if height < 0:
+            return None, "negative"
+        if height > self.height:
+            return None, "future"
+        # The scan is cached per contract and only walks the canonical chain,
+        # so a deploy buried in an abandoned fork never counts as creation.
+        creation = self.contract_creation_height(address)
+        if creation is None:
+            return None, "missing"
+        if height < creation:
+            return {
+                "address": address,
+                "height": height,
+                "current_height": self.height,
+                "created_at": creation,
+                "existed": False,
+            }, "before_creation"
+        snapshot = self.state_at(height)
+        c = snapshot.contract(address)
+        block = self.get_block(height)
+        return {
+            "address": address,
+            "height": height,
+            "current_height": self.height,
+            "created_at": creation,
+            "existed": True,
+            "creator": c.get("creator"),
+            "code": c.get("code"),
+            "storage": c.get("storage", {}),
+            "balance": snapshot.balance(address),
+            "state_root": block.state_root if block else None,
+            "block_hash": block.hash if block else None,
+            "block_timestamp": block.timestamp if block else None,
+            "events": self.contract_events_until(address, height),
+        }, None
+
+    def contract_diff(self, address, height_a, height_b):
+        """Compare a contract's state at two historical heights (read-only).
+
+        Returns ``(payload, error)`` with the same sentinels as
+        :meth:`contract_history`; both heights must be within
+        ``[creation, current]``.
+        """
+        lo, hi = sorted((height_a, height_b))
+        if lo < 0:
+            return None, "negative"
+        if hi > self.height:
+            return None, "future"
+        creation = self.contract_creation_height(address)
+        if creation is None:
+            return None, "missing"
+        if lo < creation:
+            return None, "before_creation"
+
+        state_a = self.state_at(lo)
+        state_b = self.state_at(hi)
+        ca, cb = state_a.contract(address), state_b.contract(address)
+        block_a, block_b = self.get_block(lo), self.get_block(hi)
+        return {
+            "address": address,
+            "current_height": self.height,
+            "created_at": creation,
+            "a": {
+                "height": lo,
+                "storage": ca.get("storage", {}),
+                "balance": state_a.balance(address),
+                "state_root": block_a.state_root,
+                "block_hash": block_a.hash,
+                "block_timestamp": block_a.timestamp,
+            },
+            "b": {
+                "height": hi,
+                "storage": cb.get("storage", {}),
+                "balance": state_b.balance(address),
+                "state_root": block_b.state_root,
+                "block_hash": block_b.hash,
+                "block_timestamp": block_b.timestamp,
+            },
+            "storage_diff": self._storage_diff(ca.get("storage", {}),
+                                               cb.get("storage", {})),
+            "balance_delta": state_b.balance(address) - state_a.balance(address),
+            "events_between": self.contract_events_between(address, lo, hi),
+        }, None
+
+    def contract_events_between(self, address, lo, hi):
+        """Successful events for ``address`` in blocks ``lo+1 .. hi``.
+
+        Events emitted in ``lo`` itself belong to the "before" snapshot and are
+        excluded from the between-set.
+        """
+        events = []
+        for h in range(lo + 1, hi + 1):
+            for r in self.receipts_at(h) or []:
+                if r.get("contract") != address or not r.get("ok"):
+                    continue
+                for e in r.get("events") or []:
+                    events.append({
+                        "height": h, "txid": r.get("txid"),
+                        "event": e.get("event"), "data": e.get("data"),
+                    })
+        return events
 
     # ==================================================================== #
     # Dashboard / display aggregation helpers

@@ -41,6 +41,7 @@ WALLETS_FILE = "wallets.json"
 VERSIONS_FILE = "versions.json"
 LOGS_FILE = "logs.json"
 CONTRACTS_SUBDIR = "contracts"
+RECEIPTS_SUBDIR = "receipts"
 
 # ---------------------------------------------------------------------------
 # Smart-contract sandbox limits

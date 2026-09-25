@@ -49,6 +49,12 @@ class Node:
     # ==================================================================== #
     # Lifecycle
     # ==================================================================== #
+    @property
+    def chain_lock(self):
+        """RLock guarding chain mutation; history reads take it to avoid
+        observing a reorg halfway through a multi-block snapshot read."""
+        return self._lock
+
     def start(self):
         self.blockchain.load()
         self._load_txpool()
